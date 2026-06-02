@@ -1,0 +1,4 @@
+customtkinter
+PyMuPDF
+edge-tts
+pyttsx3

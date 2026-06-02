@@ -1,13 +1,16 @@
+import json
+import os
 import tkinter as tk
 import tkinter.filedialog as fd
 import tkinter.messagebox as mb
-import threading
 
 import customtkinter as ctk
 
 from src.pdf_reader import PDFReader
 from src.tts_engine import TTSEngine
 from src.voice_manager import VoiceManager
+
+_BOOKMARKS_FILE = os.path.join(os.path.expanduser("~"), ".documentreader_bookmarks.json")
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
@@ -30,6 +33,7 @@ class DocumentReaderApp(ctk.CTk):
         self._reading = False
         self._paused = False
         self._pending_after_id = None
+        self._current_pdf_path: str | None = None
 
         self._build_ui()
         self._load_voices()
@@ -209,12 +213,14 @@ class DocumentReaderApp(ctk.CTk):
             mb.showerror("Error", f"Could not open PDF:\n{e}")
             return
 
+        self._current_pdf_path = path
         self._current_page = 0
         self._title_label.configure(text=path.split("/")[-1].split("\\")[-1])
         self._set_status(f"{count} page(s)")
         self._update_page_display()
         self._update_nav_buttons()
         self._play_btn.configure(state="normal")
+        self._restore_bookmark(path)
 
     def _update_page_display(self):
         text = self._pdf.get_all_text(self._current_page)
@@ -278,10 +284,13 @@ class DocumentReaderApp(ctk.CTk):
         if self._reading and not self._paused:
             self._tts.pause()
             self._paused = True
+            self._save_bookmark()
             self._play_btn.configure(state="normal", text="▶  Resume")
             self._pause_btn.configure(state="disabled")
 
     def _stop(self):
+        if self._reading or self._paused:
+            self._save_bookmark()
         self._reading = False
         self._paused = False
         if self._pending_after_id is not None:
@@ -370,7 +379,67 @@ class DocumentReaderApp(ctk.CTk):
     def _set_status(self, msg: str):
         self._status_label.configure(text=msg)
 
+    # ------------------------------------------------------------------
+    # Bookmark persistence
+    # ------------------------------------------------------------------
+
+    def _load_bookmarks(self) -> dict:
+        try:
+            with open(_BOOKMARKS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {}
+
+    def _save_bookmark(self):
+        """Persist current page + sentence index for the open PDF."""
+        if not self._current_pdf_path:
+            return
+        bookmarks = self._load_bookmarks()
+        bookmarks[self._current_pdf_path] = {
+            "page": self._current_page,
+            "sentence_idx": self._sentence_idx,
+        }
+        try:
+            with open(_BOOKMARKS_FILE, "w", encoding="utf-8") as f:
+                json.dump(bookmarks, f, indent=2)
+        except OSError:
+            pass
+
+    def _restore_bookmark(self, path: str) -> bool:
+        """Jump to saved position for *path*. Returns True if a bookmark existed."""
+        bookmarks = self._load_bookmarks()
+        bm = bookmarks.get(path)
+        if not bm:
+            return False
+        page = bm.get("page", 0)
+        sentence_idx = bm.get("sentence_idx", 0)
+        if page >= self._pdf.page_count:
+            return False
+        # Skip the prompt if the bookmark is at the very beginning
+        if page == 0 and sentence_idx == 0:
+            return True
+        resume = mb.askyesno(
+            "Resume Reading",
+            f"A bookmark was found for this document.\n\n"
+            f"Resume from page {page + 1}, sentence {sentence_idx + 1}?",
+        )
+        if resume:
+            self._current_page = page
+            # Only reload page text if jumping to a different page
+            if page != 0:
+                self._sentences = self._pdf.get_sentences(self._current_page)
+                text = self._pdf.get_all_text(self._current_page)
+                self._text_box.configure(state="normal")
+                self._text_box.delete("1.0", "end")
+                self._text_box.insert("end", text if text else "(No text found on this page)")
+                self._text_box.configure(state="disabled")
+                self._page_label.configure(text=f"Page {page + 1} of {self._pdf.page_count}")
+                self._update_nav_buttons()
+            self._sentence_idx = sentence_idx
+        return True
+
     def on_close(self):
+        self._save_bookmark()
         self._tts.stop()
         self._pdf.close()
         self.destroy()
