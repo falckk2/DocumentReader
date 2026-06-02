@@ -44,39 +44,51 @@ For each open issue:
 - Verify the fix logically addresses the root cause described.
 
 ### Step 4 — Update issues.md
-After each fix, update the issue entry in `issues.md` with:
+After each fix attempt, do two things:
 
-```
-**Status**: Resolved ✅  
-**Fix Applied**: [Brief description of what was changed and in which file(s)]  
-**Date**: [Today's date]  
+**1. Update the top-level `Status` field** at the top of the issue entry. Canonical status values (use exactly as written):
+- `FIXED ✅` — fix applied successfully
+- `PARTIAL ⚠️` — fix applied but known remaining work exists
+- `BLOCKED ⛔` — cannot proceed without external input
+- `WONT_FIX 🚫` — intentionally not fixing (document why in `### Fix`)
+
+**2. Add a `### Fix` sub-section** to the issue entry (after `### Discovery`, before `### Validation` if one exists):
+
+```markdown
+### Fix
+- **Date**: YYYY-MM-DD
+- **Changes**: Brief description of what changed and in which file(s)
 ```
 
-If the issue could not be resolved:
-```
-**Status**: Blocked ⛔  
-**Blocker**: [Specific description of what is needed — e.g., missing information, requires supervisor decision, depends on another fix, needs external resource]  
-**Date**: [Today's date]  
+If partially resolved, add:
+```markdown
+- **Remaining**: What still needs to be addressed and why
 ```
 
-If partially resolved:
+If blocked, add:
+```markdown
+- **Blocker**: Specific description of what is needed (missing information, supervisor decision needed, depends on another fix, needs external resource)
 ```
-**Status**: Partially Resolved ⚠️  
-**Fix Applied**: [What was done]  
-**Remaining**: [What still needs to be addressed and why]  
-**Date**: [Today's date]  
+
+If not fixing intentionally, add:
+```markdown
+- **Rationale**: Why this is intentionally not being fixed
 ```
+
+Before starting any fix, check the `Depends On` field in `### Discovery`. If it lists another issue, verify that issue is `FIXED ✅` or `VALIDATED ✅` first — if not, set Status to `BLOCKED ⛔` and note the dependency in `Blocker`.
+
+Do NOT modify the `### Discovery` section written by bug-detective. Do NOT write a `### Validation` section — that belongs to issue-solution-validator.
 
 ## Decision Framework
 
 | Scenario | Action |
 |---|---|
-| Clear issue + clear solution suggestion | Implement as described, verify logic, mark Resolved |
-| Clear issue + vague/missing solution | Use best judgment based on codebase context, document your reasoning |
-| Issue requires external input (API keys, design decisions, hardware) | Mark Blocked, specify exactly what is needed |
-| Issue depends on another issue being fixed first | Note the dependency, fix prerequisite first if possible |
-| Suggested solution would break Python 3.14 compatibility | Do NOT apply it; mark Blocked and explain the constraint |
-| Issue is already resolved in code but not in issues.md | Mark Resolved and note it was already fixed |
+| Clear issue + clear solution suggestion | Implement as described, verify logic, set Status: `FIXED ✅` |
+| Clear issue + vague/missing solution | Use best judgment based on codebase context, document reasoning in `### Fix` |
+| Issue requires external input (API keys, design decisions, hardware) | Set Status: `BLOCKED ⛔`, specify exactly what is needed in `Blocker` field |
+| Issue depends on another issue being fixed first | Note the dependency in `### Fix`, fix prerequisite first if possible |
+| Suggested solution would break Python 3.14 compatibility | Do NOT apply it; set Status: `BLOCKED ⛔` and explain the constraint |
+| Issue is already resolved in code but not in issues.md | Set Status: `FIXED ✅` and note it was already fixed in `Changes` field |
 
 ## Quality Checks Before Marking Resolved
 - [ ] The fix directly addresses the root cause described in the issue.

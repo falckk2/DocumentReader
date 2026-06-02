@@ -68,9 +68,10 @@ For each issue, design tests that:
 - Assess code quality and correctness without rewriting anything
 
 ### Step 5: issues.md Update
+- Update the top-level `Status` field and add a `### Validation` sub-section (see Output Format below)
 - Be precise and factual — report what you observed, not what you hoped to see
-- Use clear status markers so the team can quickly scan resolution status
-- Flag any new issues you discover but do NOT fix them
+- Use the canonical status values exactly as specified — agents from other sessions parse these
+- Flag any new issues you discover as new ISSUE entries; do NOT fix them inline
 
 ## Project Context
 This is a Python-based desktop PDF reader (DocumentReader) using:
@@ -92,19 +93,35 @@ Always keep this stack in mind when writing tests — do not introduce incompati
 
 ## Output Format for issues.md Updates
 
-When updating an issue entry in issues.md, append a validation block like:
+After validation, do two things:
 
+**1. Update the top-level `Status` field** at the top of the issue entry. Canonical status values (use exactly as written):
+- `VALIDATED ✅` — fix confirmed correct; issue is resolved
+- `OPEN` — fix is wrong or insufficient; reopen for another fix attempt (explain in `### Validation`)
+- `PARTIAL ⚠️` — fix is partially correct; some aspects confirmed, known gaps remain
+
+**2. Add a `### Validation` sub-section** to the issue entry (after `### Fix`):
+
+```markdown
+### Validation
+- **Date**: YYYY-MM-DD
+- **Method**: Tests + code inspection
+- **Tests**: `tests/test_<issue_name>.py` — test_fn_1, test_fn_2
+- **Results**: X passed, Y failed
+  - ✅ test_fn_1
+  - ❌ test_fn_2 — [error message summary]
+- **Inspection**: 2-4 sentences on what was found in the code
+- **Verdict**: Clear 1-2 sentence conclusion on whether the issue is truly resolved
+- **New Issues**: None | [list any new problems discovered — do NOT fix them here]
 ```
-### Validation Report — [DATE]
-**Status**: VALIDATED ✅ / FAILED ❌ / PARTIAL ⚠️
-**Tests Written**: `tests/test_<issue_name>.py` — [list test function names]
-**Test Results**: X passed, Y failed
-  - ✅ test_name_here
-  - ❌ test_name_here — [error message summary]
-**Code Inspection**: [2-4 sentences on what was found in the code]
-**Verdict**: [Clear 1-2 sentence conclusion on whether the issue is resolved]
-**New Issues Found**: [List any new problems discovered, or "None"]
+
+If no tests were written (e.g., threading issues not feasibly unit-testable), use:
+```markdown
+- **Method**: Code inspection only
 ```
+and omit the `Tests` and `Results` lines.
+
+Do NOT modify `### Discovery` or `### Fix` sections. Do NOT fix issues you discover during validation — add them as new ISSUE entries in issues.md instead.
 
 **Update your agent memory** as you discover patterns in the issues.md file, common fix strategies used in this codebase, recurring problem areas (e.g., audio playback, TTS routing, GUI state), and test infrastructure conventions. This builds institutional knowledge across validation sessions.
 
