@@ -1,0 +1,1 @@
+- [DocumentReader Bug Patterns](project-docreader-patterns.md) — Recurring threading/state bugs and their fix strategies across audio_player, tts_engine, and app

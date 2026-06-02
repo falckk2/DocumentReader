@@ -1,6 +1,9 @@
 import asyncio
+import logging
 import threading
 from dataclasses import dataclass
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -25,8 +28,11 @@ class VoiceManager:
         """Load voices in a background thread. Calls on_done(voices) when complete."""
         def _load():
             voices = []
-            voices.extend(self._load_offline_voices())
-            voices.extend(self._load_online_voices())
+            offline = self._load_offline_voices()
+            online = self._load_online_voices()
+            log.info("Voice load: %d offline, %d online", len(offline), len(online))
+            voices.extend(offline)
+            voices.extend(online)
             self._voices = voices
             self._loaded = True
             if on_done:
@@ -59,6 +65,7 @@ class VoiceManager:
                 ))
             return result
         except Exception:
+            log.exception("Failed to load offline (pyttsx3) voices")
             return []
 
     def _load_online_voices(self) -> list[Voice]:
@@ -80,6 +87,7 @@ class VoiceManager:
                 ))
             return result
         except Exception:
+            log.exception("Failed to load online (edge-tts) voices (network or API error?)")
             return []
 
     @property

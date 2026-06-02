@@ -5,10 +5,13 @@ All mciSendStringW calls are routed through a single worker thread so that
 COM apartment thread affinity is respected on Windows 10/11.
 """
 import ctypes
+import logging
 import os
 import queue
 import threading
 import time
+
+log = logging.getLogger(__name__)
 
 _winmm = ctypes.WinDLL("winmm")
 _ALIAS = "DocumentReaderTrack"
@@ -29,6 +32,8 @@ def _mci_worker() -> None:
         cmd, result_q = item
         buf = ctypes.create_unicode_buffer(256)
         ret = _winmm.mciSendStringW(cmd, buf, 255, None)
+        if ret != 0:
+            log.debug("MCI command failed ret=%d cmd=%r reply=%r", ret, cmd, buf.value.strip())
         result_q.put((ret, buf.value.strip()))
 
 
@@ -74,9 +79,11 @@ class AudioPlayer:
 
         abs_path = os.path.abspath(filepath).replace("/", "\\")
 
+        log.debug("AudioPlayer.play: opening %s", abs_path)
         _mci(f'close {_ALIAS}')
         ret = _mci(f'open "{abs_path}" type mpegvideo alias {_ALIAS}')
         if ret != 0:
+            log.error("MCI open failed (ret=%d) for %s; firing on_done immediately", ret, abs_path)
             if on_done:
                 on_done()
             return
@@ -87,8 +94,9 @@ class AudioPlayer:
         _mci(f'set {_ALIAS} time format milliseconds')
         _mci(f'play {_ALIAS}')
 
-        self._playing = True
-        self._paused = False
+        with self._lock:
+            self._playing = True
+            self._paused = False
 
         def _monitor():
             # Brief delay so MCI can parse the file and report length
@@ -98,7 +106,8 @@ class AudioPlayer:
             try:
                 track_length = int(_mci_query(f'status {_ALIAS} length'))
             except Exception:
-                pass
+                log.warning("Could not read track length; position-based end detection disabled")
+            log.debug("Monitor started: track_length=%dms", track_length)
 
             while not self._stop_event.is_set():
                 time.sleep(0.1)
@@ -121,23 +130,29 @@ class AudioPlayer:
                         time.sleep(0.05)
                     break
 
-            self._playing = False
-            self._paused = False
-            if not self._stop_event.is_set() and self._on_done:
+            with self._lock:
+                self._playing = False
+                self._paused = False
+            fire = not self._stop_event.is_set() and self._on_done
+            log.debug("Monitor exiting (stop_event=%s, will_fire_on_done=%s)",
+                      self._stop_event.is_set(), bool(fire))
+            if fire:
                 self._on_done()
 
         self._monitor_thread = threading.Thread(target=_monitor, daemon=True)
         self._monitor_thread.start()
 
     def pause(self):
-        if self._playing and not self._paused:
-            _mci(f'pause {_ALIAS}')
-            self._paused = True
+        with self._lock:
+            if self._playing and not self._paused:
+                _mci(f'pause {_ALIAS}')
+                self._paused = True
 
     def resume(self):
-        if self._playing and self._paused:
-            _mci(f'resume {_ALIAS}')
-            self._paused = False
+        with self._lock:
+            if self._playing and self._paused:
+                _mci(f'resume {_ALIAS}')
+                self._paused = False
 
     def stop(self):
         self._stop_event.set()
@@ -147,14 +162,23 @@ class AudioPlayer:
                 _mci(f'close {_ALIAS}')
                 self._open = False
         if self._monitor_thread and self._monitor_thread.is_alive():
-            self._monitor_thread.join(timeout=2.0)
-        self._playing = False
-        self._paused = False
+            if threading.current_thread() is self._monitor_thread:
+                log.error("AudioPlayer.stop() called from monitor thread itself; skipping self-join "
+                          "to avoid deadlock")
+            else:
+                joined = self._monitor_thread.join(timeout=2.0)  # noqa: F841 (join returns None)
+                if self._monitor_thread.is_alive():
+                    log.warning("Monitor thread did not exit within 2s join timeout")
+        with self._lock:
+            self._playing = False
+            self._paused = False
 
     @property
     def is_playing(self) -> bool:
-        return self._playing and not self._paused
+        with self._lock:
+            return self._playing and not self._paused
 
     @property
     def is_paused(self) -> bool:
-        return self._paused
+        with self._lock:
+            return self._paused

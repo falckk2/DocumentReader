@@ -1,5 +1,8 @@
+import logging
 import re
 import fitz  # PyMuPDF
+
+log = logging.getLogger(__name__)
 
 
 class PDFReader:
@@ -13,6 +16,16 @@ class PDFReader:
             self._doc.close()
         self._doc = fitz.open(path)
         self._path = path
+        # ISSUE-015 fix: detect password-protected PDFs and raise a clear
+        # error rather than silently returning empty text for every page.
+        if self._doc.is_encrypted:
+            self._doc.close()
+            self._doc = None
+            raise ValueError(
+                "This PDF is password-protected. "
+                "Encrypted PDFs are not currently supported."
+            )
+        log.info("PDFReader opened %s (%d pages)", path, len(self._doc))
         return len(self._doc)
 
     def close(self):
@@ -32,8 +45,14 @@ class PDFReader:
         """Extract plain text from a page (0-indexed)."""
         if not self._doc or page_index < 0 or page_index >= len(self._doc):
             return ""
-        page = self._doc[page_index]
-        text = page.get_text("text")
+        # ISSUE-015 fix: wrap per-page extraction in try/except so a malformed
+        # page does not propagate an exception into the GUI thread.
+        try:
+            page = self._doc[page_index]
+            text = page.get_text("text")
+        except Exception:
+            log.exception("Failed to extract text from page %d of %s", page_index, self._path)
+            return ""
         # Normalize whitespace but preserve paragraph breaks
         text = re.sub(r"\n{3,}", "\n\n", text)
         return text.strip()

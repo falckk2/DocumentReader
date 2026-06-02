@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import tkinter as tk
 import tkinter.filedialog as fd
@@ -9,6 +10,8 @@ import customtkinter as ctk
 from src.pdf_reader import PDFReader
 from src.tts_engine import TTSEngine
 from src.voice_manager import VoiceManager
+
+log = logging.getLogger(__name__)
 
 _BOOKMARKS_FILE = os.path.join(os.path.expanduser("~"), ".documentreader_bookmarks.json")
 
@@ -35,7 +38,21 @@ class DocumentReaderApp(ctk.CTk):
         self._pending_after_id = None
         self._current_pdf_path: str | None = None
 
+        # ISSUE-003 fix: used by _on_sentence_done (background thread) to
+        # marshal "sentence done" notifications safely to the GUI thread via
+        # event_generate, which is the only thread-safe Tk call from non-GUI
+        # threads.
+        self._sentence_done_event = "<<SentenceDone>>"
+
+        # ISSUE-005 fix: track the text-widget index where the last highlight
+        # ended so the next search starts there, avoiding mis-highlighting
+        # repeated phrases that appear earlier on the page.
+        self._highlight_search_start = "1.0"
+
         self._build_ui()
+        # ISSUE-003 fix: bind the virtual event on the GUI thread after the
+        # window exists so event_generate from background threads is safe.
+        self.bind(self._sentence_done_event, self._on_sentence_done_event)
         self._load_voices()
 
     # ------------------------------------------------------------------
@@ -179,19 +196,28 @@ class DocumentReaderApp(ctk.CTk):
         self._set_status("Loading voices…")
 
         def on_done(voices):
-            if not voices:
-                self.after(0, lambda: self._set_status("No voices found"))
-                return
-            display = [str(v) for v in voices]
-            default = self._voices.get_default_voice()
-            default_str = str(default) if default else display[0]
+            # NOTE: this callback runs on the VoiceManager background thread.
+            # ISSUE-014 fix: wrap in try/except so failures here do not
+            # silently leave the UI stuck on "Loading voices…" forever.
+            try:
+                log.debug("Voice load callback fired with %d voices", len(voices))
+                if not voices:
+                    log.warning("No voices were discovered (offline + online both empty)")
+                    self.after(0, lambda: self._set_status("No voices found"))
+                    return
+                display = [str(v) for v in voices]
+                default = self._voices.get_default_voice()
+                default_str = str(default) if default else display[0]
 
-            def update():
-                self._voice_menu.configure(values=display)
-                self._voice_var.set(default_str)
-                self._set_status(f"{len(voices)} voices loaded")
+                def update():
+                    self._voice_menu.configure(values=display)
+                    self._voice_var.set(default_str)
+                    self._set_status(f"{len(voices)} voices loaded")
 
-            self.after(0, update)
+                self.after(0, update)
+            except Exception:
+                log.exception("Unexpected error in voice-load callback; UI may be stuck")
+                self.after(0, lambda: self._set_status("Error loading voices"))
 
         self._voices.load(on_done=on_done)
 
@@ -207,15 +233,18 @@ class DocumentReaderApp(ctk.CTk):
         if not path:
             return
         self._stop()
+        log.info("Opening PDF: %s", path)
         try:
             count = self._pdf.open(path)
         except Exception as e:
+            log.exception("Failed to open PDF: %s", path)
             mb.showerror("Error", f"Could not open PDF:\n{e}")
             return
 
+        log.info("PDF opened with %d page(s)", count)
         self._current_pdf_path = path
         self._current_page = 0
-        self._title_label.configure(text=path.split("/")[-1].split("\\")[-1])
+        self._title_label.configure(text=os.path.basename(path))
         self._set_status(f"{count} page(s)")
         self._update_page_display()
         self._update_nav_buttons()
@@ -226,6 +255,8 @@ class DocumentReaderApp(ctk.CTk):
         text = self._pdf.get_all_text(self._current_page)
         self._sentences = self._pdf.get_sentences(self._current_page)
         self._sentence_idx = 0
+        # ISSUE-005 fix: reset search start for highlight tracking on new page.
+        self._highlight_search_start = "1.0"
 
         self._text_box.configure(state="normal")
         self._text_box.delete("1.0", "end")
@@ -233,6 +264,8 @@ class DocumentReaderApp(ctk.CTk):
         self._text_box.configure(state="disabled")
 
         total = self._pdf.page_count
+        log.debug("Page display updated: page %d/%d, %d sentence(s), text_len=%d",
+                  self._current_page + 1, total, len(self._sentences), len(text))
         self._page_label.configure(text=f"Page {self._current_page + 1} of {total}")
 
     def _update_nav_buttons(self):
@@ -260,19 +293,32 @@ class DocumentReaderApp(ctk.CTk):
 
     def _play(self):
         if not self._pdf.is_open:
+            log.debug("_play ignored: no PDF open")
             return
         if self._paused:
+            log.info("Resuming playback at sentence_idx=%d", self._sentence_idx)
+            # ISSUE-006 fix: for online voices, resume the paused MCI player.
+            # For offline voices there is no true pause (pyttsx3 was stopped),
+            # so we re-read starting from _sentence_idx (which was rewound in
+            # _pause to point at the interrupted sentence).
             self._tts.resume()
             self._paused = False
             self._play_btn.configure(state="disabled")
             self._pause_btn.configure(state="normal")
             self._stop_btn.configure(state="normal")
+            # For offline, _player.is_paused is False after stop, so resume()
+            # is a no-op; we fall through to _read_next_sentence to restart.
+            if not self._tts.is_playing:
+                self._reading = True
+                self._read_next_sentence()
             return
 
         if not self._sentences:
             self._set_status("No text to read on this page.")
             return
 
+        log.info("Starting playback: page %d, %d sentence(s) from idx=%d",
+                 self._current_page + 1, len(self._sentences), self._sentence_idx)
         self._reading = True
         self._paused = False
         self._play_btn.configure(state="disabled")
@@ -282,6 +328,13 @@ class DocumentReaderApp(ctk.CTk):
 
     def _pause(self):
         if self._reading and not self._paused:
+            # ISSUE-007 fix: _sentence_idx was already incremented before the
+            # current sentence was sent to the TTS engine.  Rewind by one so
+            # the bookmark and the offline-resume path both point at the
+            # sentence that was actually interrupted.
+            if self._sentence_idx > 0:
+                self._sentence_idx -= 1
+            log.info("Pausing playback at sentence_idx=%d (rewound)", self._sentence_idx)
             self._tts.pause()
             self._paused = True
             self._save_bookmark()
@@ -289,7 +342,14 @@ class DocumentReaderApp(ctk.CTk):
             self._pause_btn.configure(state="disabled")
 
     def _stop(self):
+        log.info("Stop requested (reading=%s, paused=%s, idx=%d)",
+                 self._reading, self._paused, self._sentence_idx)
         if self._reading or self._paused:
+            # ISSUE-007 fix: if actively reading (not paused), _sentence_idx
+            # was post-incremented before speech; rewind to the interrupted
+            # sentence so the bookmark restores correctly.
+            if self._reading and not self._paused and self._sentence_idx > 0:
+                self._sentence_idx -= 1
             self._save_bookmark()
         self._reading = False
         self._paused = False
@@ -305,36 +365,62 @@ class DocumentReaderApp(ctk.CTk):
 
     def _read_next_sentence(self):
         if not self._reading or self._paused:
+            log.debug("_read_next_sentence skipped (reading=%s, paused=%s)", self._reading, self._paused)
             return
         if self._sentence_idx >= len(self._sentences):
             # Page finished
+            log.info("Page %d finished (idx=%d >= %d sentences)",
+                     self._current_page + 1, self._sentence_idx, len(self._sentences))
             self._pending_after_id = self.after(0, self._on_page_done)
             return
 
         sentence = self._sentences[self._sentence_idx]
         self._highlight_sentence(sentence)
 
-        voice = self._voices.find_by_display(self._voice_var.get())
+        display = self._voice_var.get()
+        voice = self._voices.find_by_display(display)
         if voice is None:
+            log.warning("No voice resolved for dropdown value %r; stopping", display)
             self._set_status("No voice selected.")
             self._stop()
             return
 
         speed = self._speed_var.get()
+        log.debug("Speaking sentence idx=%d (len=%d) voice=%s source=%s speed=%.2f",
+                  self._sentence_idx, len(sentence), voice.id, voice.source, speed)
         self._sentence_idx += 1
         self._tts.speak(sentence, voice, speed, on_done=self._on_sentence_done)
 
     def _on_sentence_done(self):
+        # NOTE: invoked from a TTS/audio background thread, not the GUI thread.
+        # ISSUE-003 fix: use event_generate (the only thread-safe Tk call from
+        # a non-GUI thread) to marshal to the GUI thread.  Do NOT call
+        # self.after() here — after() is not thread-safe.
+        log.debug("Sentence done callback (reading=%s, paused=%s, next_idx=%d)",
+                  self._reading, self._paused, self._sentence_idx)
         if self._reading and not self._paused:
-            self._pending_after_id = self.after(0, self._read_next_sentence)
+            try:
+                self.event_generate(self._sentence_done_event, when="tail")
+            except Exception:
+                # Window may be closing; ignore
+                pass
+
+    def _on_sentence_done_event(self, _event=None):
+        # Runs on the GUI thread in response to <<SentenceDone>>.
+        if self._reading and not self._paused:
+            self._read_next_sentence()
 
     def _on_page_done(self):
         if self._auto_advance_var.get() and self._current_page < self._pdf.page_count - 1:
-            # Auto-advance to next page
+            log.info("Auto-advancing from page %d to %d", self._current_page + 1, self._current_page + 2)
+            # ISSUE-004 fix: clear the previous page's highlight before loading
+            # the next page so there is no stale highlight during the transition.
+            self._clear_highlight()
             self._current_page += 1
-            self._update_page_display()
+            self._update_page_display()   # resets _sentence_idx = 0 and rebuilds _sentences
             self._update_nav_buttons()
-            self._sentence_idx = 0
+            # _update_page_display already set _sentence_idx = 0; call
+            # _read_next_sentence directly (we are already on the GUI thread).
             self._read_next_sentence()
         else:
             if self._current_page >= self._pdf.page_count - 1:
@@ -348,23 +434,31 @@ class DocumentReaderApp(ctk.CTk):
     # ------------------------------------------------------------------
 
     def _highlight_sentence(self, sentence: str):
+        # ISSUE-005 fix: search forward from where the last highlight ended
+        # so repeated phrases on the same page are highlighted in order.
         self._text_box.configure(state="normal")
         self._text_box.tag_remove("highlight", "1.0", "end")
-        start = "1.0"
-        while True:
-            pos = self._text_box.search(sentence[:40], start, stopindex="end", nocase=False)
-            if not pos:
-                break
+        search_key = sentence[:40]
+        pos = self._text_box.search(
+            search_key, self._highlight_search_start, stopindex="end", nocase=False
+        )
+        if not pos:
+            # Wrap around (e.g. sentence_idx was rewound after pause/resume)
+            pos = self._text_box.search(search_key, "1.0", stopindex="end", nocase=False)
+        if pos:
             end = f"{pos}+{len(sentence)}c"
             self._text_box.tag_add("highlight", pos, end)
             self._text_box.see(pos)
-            break
+            # Advance the search start past this occurrence for the next call
+            self._highlight_search_start = end
         self._text_box.configure(state="disabled")
 
     def _clear_highlight(self):
         self._text_box.configure(state="normal")
         self._text_box.tag_remove("highlight", "1.0", "end")
         self._text_box.configure(state="disabled")
+        # ISSUE-005 fix: reset search position when highlight is cleared.
+        self._highlight_search_start = "1.0"
 
     # ------------------------------------------------------------------
     # Event handlers
@@ -387,7 +481,8 @@ class DocumentReaderApp(ctk.CTk):
         try:
             with open(_BOOKMARKS_FILE, "r", encoding="utf-8") as f:
                 return json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
+        except (FileNotFoundError, json.JSONDecodeError) as e:
+            log.debug("No usable bookmarks file (%s): %s", _BOOKMARKS_FILE, e)
             return {}
 
     def _save_bookmark(self):
@@ -399,11 +494,13 @@ class DocumentReaderApp(ctk.CTk):
             "page": self._current_page,
             "sentence_idx": self._sentence_idx,
         }
+        log.debug("Saving bookmark for %s: page=%d sentence_idx=%d",
+                  self._current_pdf_path, self._current_page, self._sentence_idx)
         try:
             with open(_BOOKMARKS_FILE, "w", encoding="utf-8") as f:
                 json.dump(bookmarks, f, indent=2)
-        except OSError:
-            pass
+        except OSError as e:
+            log.error("Failed to write bookmarks file %s: %s", _BOOKMARKS_FILE, e)
 
     def _restore_bookmark(self, path: str) -> bool:
         """Jump to saved position for *path*. Returns True if a bookmark existed."""
@@ -413,7 +510,10 @@ class DocumentReaderApp(ctk.CTk):
             return False
         page = bm.get("page", 0)
         sentence_idx = bm.get("sentence_idx", 0)
+        log.info("Bookmark found for %s: page=%d sentence_idx=%d (doc has %d pages)",
+                 path, page, sentence_idx, self._pdf.page_count)
         if page >= self._pdf.page_count:
+            log.warning("Bookmark page %d out of range; ignoring", page)
             return False
         # Skip the prompt if the bookmark is at the very beginning
         if page == 0 and sentence_idx == 0:
@@ -435,10 +535,19 @@ class DocumentReaderApp(ctk.CTk):
                 self._text_box.configure(state="disabled")
                 self._page_label.configure(text=f"Page {page + 1} of {self._pdf.page_count}")
                 self._update_nav_buttons()
+            # ISSUE-009 fix: clamp sentence_idx to valid range so a stale
+            # bookmark (e.g. PDF was re-saved with fewer sentences) does not
+            # silently skip playback by starting past the last sentence.
+            max_idx = max(0, len(self._sentences) - 1)
+            if sentence_idx > max_idx:
+                log.warning("Bookmark sentence_idx=%d clamped to %d (page has %d sentences)",
+                            sentence_idx, max_idx, len(self._sentences))
+                sentence_idx = max_idx
             self._sentence_idx = sentence_idx
         return True
 
     def on_close(self):
+        log.info("Window closing; saving bookmark and tearing down")
         self._save_bookmark()
         self._tts.stop()
         self._pdf.close()
