@@ -29,12 +29,23 @@ def _mci_worker() -> None:
         item = _cmd_queue.get()
         if item is None:
             break
-        cmd, result_q = item
-        buf = ctypes.create_unicode_buffer(256)
-        ret = _winmm.mciSendStringW(cmd, buf, 255, None)
-        if ret != 0:
-            log.debug("MCI command failed ret=%d cmd=%r reply=%r", ret, cmd, buf.value.strip())
-        result_q.put((ret, buf.value.strip()))
+        # ISSUE-026 fix: guard every command individually so an unexpected
+        # exception can neither kill the dispatcher (wedging every future
+        # caller) nor orphan the current caller blocked on its result queue.
+        try:
+            cmd, result_q = item
+        except Exception:
+            log.exception("Malformed MCI command item ignored: %r", item)
+            continue
+        try:
+            buf = ctypes.create_unicode_buffer(256)
+            ret = _winmm.mciSendStringW(cmd, buf, 255, None)
+            if ret != 0:
+                log.debug("MCI command failed ret=%d cmd=%r reply=%r", ret, cmd, buf.value.strip())
+            result_q.put((ret, buf.value.strip()))
+        except Exception:
+            log.exception("MCI dispatcher error executing %r", cmd)
+            result_q.put((-1, ""))
 
 
 _worker = threading.Thread(target=_mci_worker, daemon=True)
@@ -44,14 +55,24 @@ _worker.start()
 def _mci(cmd: str) -> int:
     rq: queue.Queue = queue.Queue()
     _cmd_queue.put((cmd, rq))
-    ret, _ = rq.get()
+    # ISSUE-026 fix: never block the caller (often the GUI thread) forever.
+    try:
+        ret, _ = rq.get(timeout=5.0)
+    except queue.Empty:
+        log.error("MCI dispatcher did not respond within 5s for %r", cmd)
+        return -1
     return ret
 
 
 def _mci_query(cmd: str) -> str:
     rq: queue.Queue = queue.Queue()
     _cmd_queue.put((cmd, rq))
-    _, value = rq.get()
+    # ISSUE-026 fix: never block the caller (often the GUI thread) forever.
+    try:
+        _, value = rq.get(timeout=5.0)
+    except queue.Empty:
+        log.error("MCI dispatcher did not respond within 5s for %r", cmd)
+        return ""
     return value
 
 
@@ -133,11 +154,19 @@ class AudioPlayer:
             with self._lock:
                 self._playing = False
                 self._paused = False
-            fire = not self._stop_event.is_set() and self._on_done
+            cb = self._on_done if not self._stop_event.is_set() else None
             log.debug("Monitor exiting (stop_event=%s, will_fire_on_done=%s)",
-                      self._stop_event.is_set(), bool(fire))
-            if fire:
-                self._on_done()
+                      self._stop_event.is_set(), bool(cb))
+            if cb:
+                # ISSUE-022 fix: fire on_done from a detached dispatcher thread.
+                # The on_done chain ends in app.event_generate(), which blocks
+                # until the GUI mainloop services the marshalled call. Firing
+                # it on this monitor thread let a concurrent stop() on the GUI
+                # thread join() this thread while it was waiting on that same
+                # GUI thread — a lock-step cycle broken only by the 2s join
+                # timeout (a hard GUI freeze). The dispatcher thread lets the
+                # monitor exit immediately, so the join returns promptly.
+                threading.Thread(target=cb, daemon=True, name="on-done-dispatch").start()
 
         self._monitor_thread = threading.Thread(target=_monitor, daemon=True)
         self._monitor_thread.start()
@@ -166,7 +195,10 @@ class AudioPlayer:
                 log.error("AudioPlayer.stop() called from monitor thread itself; skipping self-join "
                           "to avoid deadlock")
             else:
-                joined = self._monitor_thread.join(timeout=2.0)  # noqa: F841 (join returns None)
+                # ISSUE-022 fix: on_done now fires on a detached dispatcher
+                # thread, so the monitor can no longer be blocked inside
+                # event_generate while we join it — this join returns promptly.
+                self._monitor_thread.join(timeout=2.0)
                 if self._monitor_thread.is_alive():
                     log.warning("Monitor thread did not exit within 2s join timeout")
         with self._lock:

@@ -148,6 +148,14 @@ class TestIssue001StopSelfJoinGuard(unittest.TestCase):
 class TestIssue002TmpFileLock(unittest.TestCase):
     """_tmp_files must be protected by _tmp_lock; cleanup tied to playback end."""
 
+    def setUp(self):
+        # Test-infrastructure fix (2026-06-12): tests below access
+        # sys.modules["src.tts_engine"], which is only populated once the
+        # module has been imported.  Alphabetical test ordering previously
+        # made two tests run before any explicit import, raising
+        # KeyError: 'src.tts_engine'.  Import explicitly here.
+        import src.tts_engine  # noqa: F401
+
     def _make_engine(self):
         """Return a TTSEngine with player+pyttsx3 worker stubbed out."""
         with patch("src.audio_player.AudioPlayer") as MockPlayer, \
@@ -823,6 +831,523 @@ class TestIssue011StatusCheck(unittest.TestCase):
         section = section_match.group()
         self.assertIn("Partially Resolved", section,
                       "ISSUE-011 status changed from 'Partially Resolved'; confirm ISSUE-011 and update")
+
+
+# ---------------------------------------------------------------------------
+# Helper for ISSUE-017/018/019 tests — TTSEngine without __init__ side effects
+# ---------------------------------------------------------------------------
+
+def _make_tts_engine():
+    """Return a TTSEngine with player stubbed and no worker thread started."""
+    from src.tts_engine import TTSEngine
+    engine = TTSEngine.__new__(TTSEngine)
+    engine._player = MagicMock()
+    engine._gen_lock = threading.Lock()
+    engine._generation = 0
+    engine._tmp_lock = threading.Lock()
+    engine._tmp_files = []
+    engine._pyttsx3_interrupt = threading.Event()
+    engine._pyttsx3_queue = queue.Queue()
+    return engine
+
+
+# ---------------------------------------------------------------------------
+# ISSUE-017 — per-utterance generation token replaces shared _stop_event
+# ---------------------------------------------------------------------------
+
+class TestIssue017GenerationToken(unittest.TestCase):
+
+    def test_generation_initialized_in_init(self):
+        import src.tts_engine as te
+        src = inspect.getsource(te.TTSEngine.__init__)
+        self.assertIn("self._generation = 0", src,
+                      "_generation token not initialized in TTSEngine.__init__")
+        self.assertIn("_gen_lock", src,
+                      "_gen_lock not initialized in TTSEngine.__init__")
+
+    def test_stop_bumps_generation(self):
+        engine = _make_tts_engine()
+        g0 = engine._generation
+        engine.stop()
+        self.assertEqual(engine._generation, g0 + 1,
+                         "stop() must bump _generation to invalidate in-flight utterances")
+
+    def test_speak_online_captures_and_checks_generation(self):
+        import src.tts_engine as te
+        src = inspect.getsource(te.TTSEngine._speak_online)
+        self.assertIn("gen = self._generation", src,
+                      "_speak_online does not capture a per-utterance generation token")
+        self.assertIn("gen == self._generation", src,
+                      "_speak_online does not verify the generation before playing")
+        self.assertNotIn("_stop_event", src,
+                         "_speak_online still references the shared _stop_event (ISSUE-017)")
+
+    def test_no_stop_event_clear_in_speak(self):
+        """speak() must not clear any shared event (the set-then-clear bug)."""
+        import src.tts_engine as te
+        src = inspect.getsource(te.TTSEngine.speak)
+        self.assertNotIn(".clear()", src,
+                         "speak() still clears a shared event — cancelled utterances can resurrect")
+
+    def test_stale_offline_on_done_suppressed(self):
+        """A generation bump after enqueue must suppress the wrapped on_done."""
+        engine = _make_tts_engine()
+        calls = []
+        voice = MagicMock(source="offline", id="v1")
+        engine._speak_offline("hello", voice, 1.0, lambda: calls.append(1))
+        cmd = engine._pyttsx3_queue.get_nowait()
+        self.assertEqual(cmd[0], "speak")
+        gated_on_done = cmd[4]
+        engine._generation += 1  # simulate stop()/pause()/newer speak()
+        gated_on_done()
+        self.assertEqual(calls, [],
+                         "stale offline on_done fired despite generation bump (ISSUE-017)")
+
+    def test_current_offline_on_done_fires(self):
+        """Without a generation bump the wrapped on_done must still fire."""
+        engine = _make_tts_engine()
+        calls = []
+        voice = MagicMock(source="offline", id="v1")
+        engine._speak_offline("hello", voice, 1.0, lambda: calls.append(1))
+        cmd = engine._pyttsx3_queue.get_nowait()
+        cmd[4]()
+        self.assertEqual(calls, [1],
+                         "current offline on_done did not fire")
+
+    def test_stale_online_synth_discarded(self):
+        """An online synth cancelled mid-flight must not play or fire on_done."""
+        engine = _make_tts_engine()
+        finished = threading.Event()
+        engine._make_tmp_mp3 = MagicMock(return_value="fake.mp3")
+        engine._delete_tmp = MagicMock(side_effect=lambda p: finished.set())
+        release = threading.Event()
+
+        async def fake_synth(text, voice_id, rate, out_path):
+            release.wait()
+
+        engine._edge_synthesize = fake_synth
+        played = []
+        voice = MagicMock(source="online", id="v1")
+        engine._speak_online("hello", voice, 1.0, lambda: played.append(1))
+        engine._generation += 1  # cancel while synthesis is in flight
+        release.set()
+        self.assertTrue(finished.wait(timeout=3), "synth thread did not finish")
+        engine._player.play.assert_not_called()
+        self.assertEqual(played, [],
+                         "stale online utterance fired on_done (ISSUE-017)")
+
+    def test_current_online_synth_plays(self):
+        """An online synth that stays current must hand off to the player."""
+        engine = _make_tts_engine()
+        handed_off = threading.Event()
+        engine._make_tmp_mp3 = MagicMock(return_value="fake.mp3")
+        engine._delete_tmp = MagicMock()
+        engine._player.play = MagicMock(side_effect=lambda *a, **kw: handed_off.set())
+
+        async def fake_synth(text, voice_id, rate, out_path):
+            pass
+
+        engine._edge_synthesize = fake_synth
+        voice = MagicMock(source="online", id="v1")
+        engine._speak_online("hello", voice, 1.0, None)
+        self.assertTrue(handed_off.wait(timeout=3),
+                        "current online utterance was not handed to the player")
+
+
+# ---------------------------------------------------------------------------
+# ISSUE-018 — offline Stop/Pause interrupt via 'started-word' callback
+# ---------------------------------------------------------------------------
+
+class TestIssue018OfflineInterrupt(unittest.TestCase):
+
+    def test_stop_sets_interrupt_event(self):
+        engine = _make_tts_engine()
+        engine.stop()
+        self.assertTrue(engine._pyttsx3_interrupt.is_set(),
+                        "stop() does not set _pyttsx3_interrupt (offline Stop stays queued)")
+
+    def test_pause_sets_interrupt_event(self):
+        engine = _make_tts_engine()
+        engine.pause()
+        self.assertTrue(engine._pyttsx3_interrupt.is_set(),
+                        "pause() does not set _pyttsx3_interrupt (offline Pause is a no-op)")
+
+    def test_worker_connects_started_word_callback(self):
+        import src.tts_engine as te
+        src = inspect.getsource(te.TTSEngine._pyttsx3_worker)
+        self.assertIn("started-word", src,
+                      "worker does not register a 'started-word' callback (ISSUE-018)")
+        self.assertIn(".connect(", src,
+                      "worker does not connect any pyttsx3 callback")
+
+    def test_worker_callback_checks_interrupt(self):
+        import src.tts_engine as te
+        src = inspect.getsource(te.TTSEngine._pyttsx3_worker)
+        self.assertIn("_pyttsx3_interrupt.is_set()", src,
+                      "worker callback does not check the interrupt flag")
+
+    def test_worker_clears_interrupt_per_utterance(self):
+        import src.tts_engine as te
+        src = inspect.getsource(te.TTSEngine._pyttsx3_worker)
+        self.assertIn("_pyttsx3_interrupt.clear()", src,
+                      "worker does not clear the interrupt flag before a fresh utterance")
+
+
+# ---------------------------------------------------------------------------
+# ISSUE-019 — pause gates in-flight online synthesis
+# ---------------------------------------------------------------------------
+
+class TestIssue019PauseGatesInFlightSynth(unittest.TestCase):
+
+    def test_pause_bumps_generation(self):
+        engine = _make_tts_engine()
+        g0 = engine._generation
+        engine.pause()
+        self.assertEqual(engine._generation, g0 + 1,
+                         "pause() must bump _generation so in-flight synth discards")
+
+    def test_pause_only_pauses_player_when_playing(self):
+        engine = _make_tts_engine()
+        engine._player.is_playing = False
+        engine.pause()
+        engine._player.pause.assert_not_called()
+
+        engine2 = _make_tts_engine()
+        engine2._player.is_playing = True
+        engine2.pause()
+        engine2._player.pause.assert_called_once()
+
+    def test_paused_in_flight_synth_does_not_play(self):
+        """pause() during synthesis must discard the result (no rogue audio)."""
+        engine = _make_tts_engine()
+        finished = threading.Event()
+        engine._make_tmp_mp3 = MagicMock(return_value="fake.mp3")
+        engine._delete_tmp = MagicMock(side_effect=lambda p: finished.set())
+        release = threading.Event()
+
+        async def fake_synth(text, voice_id, rate, out_path):
+            release.wait()
+
+        engine._edge_synthesize = fake_synth
+        played = []
+        voice = MagicMock(source="online", id="v1")
+        engine._player.is_playing = False  # synth in flight, nothing playing yet
+        engine._speak_online("hello", voice, 1.0, lambda: played.append(1))
+        engine.pause()  # user pauses during the synthesis window
+        release.set()
+        self.assertTrue(finished.wait(timeout=3), "synth thread did not finish")
+        engine._player.play.assert_not_called()
+        self.assertEqual(played, [],
+                         "sentence played/advanced despite app being paused (ISSUE-019)")
+
+
+# ---------------------------------------------------------------------------
+# ISSUE-020 — on_close applies the ISSUE-007 rewind before saving
+# ---------------------------------------------------------------------------
+
+class TestIssue020CloseRewind(unittest.TestCase):
+
+    def test_on_close_rewinds_sentence_idx(self):
+        import src.app as app_mod
+        src = inspect.getsource(app_mod.DocumentReaderApp.on_close)
+        self.assertIn("_sentence_idx -= 1", src,
+                      "on_close does not rewind _sentence_idx (ISSUE-020)")
+        self.assertIn("not self._paused", src,
+                      "on_close rewind does not guard on 'not self._paused'")
+
+    def test_rewind_happens_before_save(self):
+        import src.app as app_mod
+        src = inspect.getsource(app_mod.DocumentReaderApp.on_close)
+        rewind_pos = src.find("_sentence_idx -= 1")
+        save_pos = src.find("_save_bookmark()")
+        self.assertNotEqual(rewind_pos, -1)
+        self.assertNotEqual(save_pos, -1)
+        self.assertLess(rewind_pos, save_pos,
+                        "on_close must rewind before saving the bookmark")
+
+
+# ---------------------------------------------------------------------------
+# ISSUE-021 — failed PDFReader.open preserves the previous document
+# ---------------------------------------------------------------------------
+
+class TestIssue021FailedOpenPreservesOldDoc(unittest.TestCase):
+
+    def _open_good(self, pr):
+        good = MagicMock()
+        good.is_encrypted = False
+        good.__len__ = MagicMock(return_value=4)
+        with patch("fitz.open", return_value=good):
+            reader = pr.PDFReader()
+            reader.open("/fake/good.pdf")
+        return reader, good
+
+    def test_failed_open_preserves_previous_doc(self):
+        import src.pdf_reader as pr
+        reader, good = self._open_good(pr)
+        with patch("fitz.open", side_effect=RuntimeError("corrupt file")):
+            with self.assertRaises(RuntimeError):
+                reader.open("/fake/bad.pdf")
+        good.close.assert_not_called()
+        self.assertIs(reader._doc, good,
+                      "failed open must leave the previous document in place")
+        self.assertTrue(reader.is_open)
+        self.assertEqual(reader.page_count, 4,
+                         "page_count must remain usable after a failed open")
+        self.assertEqual(reader._path, "/fake/good.pdf",
+                         "_path must still name the previously opened file")
+
+    def test_encrypted_open_preserves_previous_doc(self):
+        import src.pdf_reader as pr
+        reader, good = self._open_good(pr)
+        encrypted = MagicMock()
+        encrypted.is_encrypted = True
+        with patch("fitz.open", return_value=encrypted):
+            with self.assertRaises(ValueError):
+                reader.open("/fake/encrypted.pdf")
+        encrypted.close.assert_called_once()
+        good.close.assert_not_called()
+        self.assertIs(reader._doc, good)
+        self.assertEqual(reader.page_count, 4)
+
+
+# ---------------------------------------------------------------------------
+# ISSUE-022 — on_done fired from a detached dispatcher thread (no join freeze)
+# ---------------------------------------------------------------------------
+
+class TestIssue022NonBlockingOnDoneDispatch(unittest.TestCase):
+
+    def test_on_done_fired_from_dispatcher_thread(self):
+        import src.audio_player as ap
+        src = inspect.getsource(ap.AudioPlayer.play)
+        self.assertIn("on-done-dispatch", src,
+                      "monitor does not fire on_done via a detached dispatcher thread (ISSUE-022)")
+
+    def test_monitor_does_not_call_on_done_inline(self):
+        import src.audio_player as ap
+        src = inspect.getsource(ap.AudioPlayer.play)
+        self.assertNotIn("self._on_done()", src,
+                         "monitor still calls on_done inline — stop() can deadlock on join (ISSUE-022)")
+
+    def test_monitor_exits_and_stop_returns_while_on_done_blocked(self):
+        """
+        Behavioral: even while on_done is blocked (simulating the blocking
+        event_generate marshal), the monitor thread must exit and stop()
+        must return promptly instead of stalling on the 2s join (ISSUE-022).
+        """
+        import src.audio_player as ap
+        ap._mci = MagicMock(return_value=0)
+        ap._mci_query = MagicMock(return_value="stopped")
+        player = ap.AudioPlayer()
+        entered = threading.Event()
+        release = threading.Event()
+
+        def blocking_on_done():
+            entered.set()
+            release.wait(timeout=10)
+
+        player.play("fake.mp3", on_done=blocking_on_done)
+        try:
+            self.assertTrue(entered.wait(timeout=3),
+                            "on_done was never fired by the monitor/dispatcher")
+            # The dispatcher thread is blocked inside on_done; the monitor
+            # thread must already have exited (or exit promptly).
+            player._monitor_thread.join(timeout=1.0)
+            self.assertFalse(player._monitor_thread.is_alive(),
+                             "monitor thread still alive while on_done blocked (ISSUE-022)")
+            # And stop() must return promptly (no 2s join-timeout freeze).
+            t0 = time.time()
+            player.stop()
+            elapsed = time.time() - t0
+            self.assertLess(elapsed, 1.5,
+                            f"stop() blocked {elapsed:.2f}s while on_done was in flight (ISSUE-022)")
+        finally:
+            release.set()
+
+
+# ---------------------------------------------------------------------------
+# ISSUE-023 — edge-tts synthesis bounded by a timeout
+# ---------------------------------------------------------------------------
+
+class TestIssue023SynthTimeout(unittest.TestCase):
+
+    def test_edge_synthesize_uses_wait_for(self):
+        import src.tts_engine as te
+        src = inspect.getsource(te.TTSEngine._edge_synthesize)
+        self.assertIn("asyncio.wait_for", src,
+                      "_edge_synthesize has no asyncio.wait_for timeout (ISSUE-023)")
+        self.assertIn("timeout", src,
+                      "_edge_synthesize does not specify a timeout")
+
+
+# ---------------------------------------------------------------------------
+# ISSUE-024 — bookmark load/restore validation
+# ---------------------------------------------------------------------------
+
+class TestIssue024BookmarkValidation(unittest.TestCase):
+
+    def test_load_bookmarks_non_dict_root_returns_empty(self):
+        import json
+        import src.app as app_mod
+        fd, path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("[1, 2, 3]")
+            with patch.object(app_mod, "_BOOKMARKS_FILE", path):
+                result = app_mod.DocumentReaderApp._load_bookmarks(MagicMock())
+            self.assertEqual(result, {},
+                             "non-dict JSON root must yield an empty bookmarks dict")
+        finally:
+            os.remove(path)
+
+    def test_load_bookmarks_handles_oserror(self):
+        import src.app as app_mod
+        with patch("builtins.open", side_effect=PermissionError("denied")):
+            result = app_mod.DocumentReaderApp._load_bookmarks(MagicMock())
+        self.assertEqual(result, {},
+                         "PermissionError must be caught and yield an empty dict")
+
+    def test_restore_validates_int_types(self):
+        import src.app as app_mod
+        src = inspect.getsource(app_mod.DocumentReaderApp._restore_bookmark)
+        self.assertIn("isinstance(page, int)", src,
+                      "_restore_bookmark does not type-check page")
+        self.assertIn("isinstance(sentence_idx, int)", src,
+                      "_restore_bookmark does not type-check sentence_idx")
+
+    def test_restore_clamps_both_ends(self):
+        import src.app as app_mod
+        src = inspect.getsource(app_mod.DocumentReaderApp._restore_bookmark)
+        self.assertIn("max(0, min(", src,
+                      "_restore_bookmark does not clamp sentence_idx at both ends (ISSUE-024)")
+        self.assertIn("max(0, page)", src,
+                      "_restore_bookmark does not clamp negative page values")
+
+    def test_restore_requires_dict_entry(self):
+        import src.app as app_mod
+        src = inspect.getsource(app_mod.DocumentReaderApp._restore_bookmark)
+        self.assertIn("isinstance(bm, dict)", src,
+                      "_restore_bookmark does not verify the bookmark entry is a dict")
+
+    def test_restore_clamps_negative_sentence_idx_behaviorally(self):
+        """A negative sentence_idx in a bookmark must clamp to 0, not index from the page end."""
+        import src.app as app_mod
+        app = app_mod.DocumentReaderApp.__new__(app_mod.DocumentReaderApp)
+        app._pdf = MagicMock(page_count=3)
+        app._sentences = ["s1", "s2"]
+        app._current_page = 0
+        app._sentence_idx = 0
+        with patch.object(app_mod.DocumentReaderApp, "_load_bookmarks",
+                          return_value={"p.pdf": {"page": 0, "sentence_idx": -3}}), \
+             patch.object(app_mod.mb, "askyesno", return_value=True):
+            result = app._restore_bookmark("p.pdf")
+        self.assertTrue(result, "_restore_bookmark should report the bookmark existed")
+        self.assertEqual(app._sentence_idx, 0,
+                         "negative sentence_idx must be clamped to 0 (ISSUE-024)")
+
+    def test_restore_ignores_string_page_behaviorally(self):
+        """A non-int page must be ignored (no TypeError in the GUI callback)."""
+        import src.app as app_mod
+        app = app_mod.DocumentReaderApp.__new__(app_mod.DocumentReaderApp)
+        app._pdf = MagicMock(page_count=3)
+        with patch.object(app_mod.DocumentReaderApp, "_load_bookmarks",
+                          return_value={"p.pdf": {"page": "3", "sentence_idx": 1}}):
+            result = app._restore_bookmark("p.pdf")
+        self.assertFalse(result,
+                         "non-int page must be rejected and treated as no bookmark (ISSUE-024)")
+
+
+# ---------------------------------------------------------------------------
+# ISSUE-025 — natural completion clears/advances the bookmark, skips rewind
+# ---------------------------------------------------------------------------
+
+class TestIssue025CompletionBookmark(unittest.TestCase):
+
+    def test_stop_accepts_completed_param(self):
+        import src.app as app_mod
+        sig = inspect.signature(app_mod.DocumentReaderApp._stop)
+        self.assertIn("completed", sig.parameters,
+                      "_stop has no 'completed' parameter (ISSUE-025)")
+        self.assertFalse(sig.parameters["completed"].default,
+                         "'completed' must default to False (Stop button passes no args)")
+
+    def test_stop_skips_rewind_when_completed(self):
+        import src.app as app_mod
+        src = inspect.getsource(app_mod.DocumentReaderApp._stop)
+        self.assertIn("not completed", src,
+                      "_stop does not skip the rewind/save when completed=True")
+
+    def test_page_done_clears_bookmark_on_document_end(self):
+        import src.app as app_mod
+        src = inspect.getsource(app_mod.DocumentReaderApp._on_page_done)
+        self.assertIn("_clear_bookmark()", src,
+                      "_on_page_done does not clear the bookmark on document completion")
+        self.assertIn("completed=True", src,
+                      "_on_page_done does not call _stop(completed=True)")
+
+    def test_page_done_bookmarks_next_page_start(self):
+        import src.app as app_mod
+        src = inspect.getsource(app_mod.DocumentReaderApp._on_page_done)
+        self.assertIn("_current_page + 1", src.split("_save_bookmark(")[1],
+                      "_on_page_done does not bookmark the start of the next page")
+        self.assertIn("sentence_idx=0", src,
+                      "_on_page_done does not bookmark sentence 0 of the next page")
+
+    def test_clear_bookmark_removes_entry(self):
+        import json
+        import src.app as app_mod
+        fd, path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"C:/doc.pdf": {"page": 1, "sentence_idx": 2},
+                           "C:/other.pdf": {"page": 0, "sentence_idx": 5}}, f)
+            app = app_mod.DocumentReaderApp.__new__(app_mod.DocumentReaderApp)
+            app._current_pdf_path = "C:/doc.pdf"
+            with patch.object(app_mod, "_BOOKMARKS_FILE", path):
+                app._clear_bookmark()
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            self.assertNotIn("C:/doc.pdf", data,
+                             "_clear_bookmark did not remove the entry")
+            self.assertIn("C:/other.pdf", data,
+                          "_clear_bookmark removed unrelated entries")
+        finally:
+            os.remove(path)
+
+
+# ---------------------------------------------------------------------------
+# ISSUE-026 — MCI dispatcher hardening (worker guard + caller timeouts)
+# ---------------------------------------------------------------------------
+
+class TestIssue026MciDispatcherHardening(unittest.TestCase):
+
+    def test_worker_guards_each_command(self):
+        import src.audio_player as ap
+        src = inspect.getsource(ap._mci_worker)
+        self.assertIn("except Exception", src,
+                      "_mci_worker has no per-command exception guard (ISSUE-026)")
+        self.assertIn('result_q.put((-1, ""))', src,
+                      "_mci_worker does not answer the caller on failure — caller would hang")
+
+    def test_callers_use_timeout(self):
+        import src.audio_player as ap
+        module_src = inspect.getsource(ap)
+        self.assertIn("rq.get(timeout=", module_src,
+                      "_mci/_mci_query block forever on rq.get() (ISSUE-026)")
+
+    def test_worker_survives_malformed_item(self):
+        """A malformed queue item must not kill the dispatcher thread."""
+        import src.audio_player as ap
+        with patch.object(ap.log, "exception"):
+            ap._cmd_queue.put(("malformed",))  # wrong arity — unpack fails
+            rq = queue.Queue()
+            ap._cmd_queue.put(("status fake mode", rq))
+            try:
+                rq.get(timeout=3)
+            except queue.Empty:
+                self.fail("MCI dispatcher did not respond after a malformed item — "
+                          "the worker thread died (ISSUE-026)")
 
 
 if __name__ == "__main__":

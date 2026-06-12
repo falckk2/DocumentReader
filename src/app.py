@@ -341,10 +341,13 @@ class DocumentReaderApp(ctk.CTk):
             self._play_btn.configure(state="normal", text="▶  Resume")
             self._pause_btn.configure(state="disabled")
 
-    def _stop(self):
-        log.info("Stop requested (reading=%s, paused=%s, idx=%d)",
-                 self._reading, self._paused, self._sentence_idx)
-        if self._reading or self._paused:
+    def _stop(self, completed: bool = False):
+        log.info("Stop requested (reading=%s, paused=%s, idx=%d, completed=%s)",
+                 self._reading, self._paused, self._sentence_idx, completed)
+        # ISSUE-025 fix: on natural completion there is no interrupted
+        # sentence — _on_page_done has already cleared or advanced the
+        # bookmark — so skip the ISSUE-007 rewind-and-save entirely.
+        if (self._reading or self._paused) and not completed:
             # ISSUE-007 fix: if actively reading (not paused), _sentence_idx
             # was post-incremented before speech; rewind to the interrupted
             # sentence so the bookmark restores correctly.
@@ -394,8 +397,8 @@ class DocumentReaderApp(ctk.CTk):
     def _on_sentence_done(self):
         # NOTE: invoked from a TTS/audio background thread, not the GUI thread.
         # ISSUE-003 fix: use event_generate (the only thread-safe Tk call from
-        # a non-GUI thread) to marshal to the GUI thread.  Do NOT call
-        # self.after() here — after() is not thread-safe.
+        # a non-GUI thread) to marshal to the GUI thread.  Do NOT schedule
+        # callbacks with after() here — it is not thread-safe.
         log.debug("Sentence done callback (reading=%s, paused=%s, next_idx=%d)",
                   self._reading, self._paused, self._sentence_idx)
         if self._reading and not self._paused:
@@ -425,9 +428,16 @@ class DocumentReaderApp(ctk.CTk):
         else:
             if self._current_page >= self._pdf.page_count - 1:
                 self._set_status("Finished reading document.")
+                # ISSUE-025 fix: the document was fully read — clear the
+                # bookmark so the next open does not offer to resume at (and
+                # re-read) the already-finished last sentence.
+                self._clear_bookmark()
             else:
                 self._set_status("Page done.")
-            self._stop()
+                # ISSUE-025 fix: the page was fully read — bookmark the start
+                # of the NEXT page instead of the already-read last sentence.
+                self._save_bookmark(page=self._current_page + 1, sentence_idx=0)
+            self._stop(completed=True)
 
     # ------------------------------------------------------------------
     # Highlighting
@@ -478,24 +488,45 @@ class DocumentReaderApp(ctk.CTk):
     # ------------------------------------------------------------------
 
     def _load_bookmarks(self) -> dict:
+        # ISSUE-024 fix: the bookmarks file is untrusted external data — catch
+        # all I/O and decoding errors (not just FileNotFoundError/JSON errors)
+        # and require a dict root before handing the data to callers.
         try:
             with open(_BOOKMARKS_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError) as e:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError) as e:
             log.debug("No usable bookmarks file (%s): %s", _BOOKMARKS_FILE, e)
             return {}
+        if not isinstance(data, dict):
+            log.warning("Bookmarks file root is %s, expected dict; ignoring",
+                        type(data).__name__)
+            return {}
+        return data
 
-    def _save_bookmark(self):
-        """Persist current page + sentence index for the open PDF."""
+    def _save_bookmark(self, page: int | None = None, sentence_idx: int | None = None):
+        """Persist current (or explicitly given) page + sentence index for the open PDF."""
         if not self._current_pdf_path:
             return
         bookmarks = self._load_bookmarks()
         bookmarks[self._current_pdf_path] = {
-            "page": self._current_page,
-            "sentence_idx": self._sentence_idx,
+            "page": self._current_page if page is None else page,
+            "sentence_idx": self._sentence_idx if sentence_idx is None else sentence_idx,
         }
-        log.debug("Saving bookmark for %s: page=%d sentence_idx=%d",
-                  self._current_pdf_path, self._current_page, self._sentence_idx)
+        log.debug("Saving bookmark for %s: %r",
+                  self._current_pdf_path, bookmarks[self._current_pdf_path])
+        self._write_bookmarks(bookmarks)
+
+    def _clear_bookmark(self):
+        """ISSUE-025 fix: remove the bookmark for the open PDF (document fully read)."""
+        if not self._current_pdf_path:
+            return
+        bookmarks = self._load_bookmarks()
+        if self._current_pdf_path in bookmarks:
+            del bookmarks[self._current_pdf_path]
+            log.debug("Cleared bookmark for %s", self._current_pdf_path)
+            self._write_bookmarks(bookmarks)
+
+    def _write_bookmarks(self, bookmarks: dict):
         try:
             with open(_BOOKMARKS_FILE, "w", encoding="utf-8") as f:
                 json.dump(bookmarks, f, indent=2)
@@ -506,10 +537,20 @@ class DocumentReaderApp(ctk.CTk):
         """Jump to saved position for *path*. Returns True if a bookmark existed."""
         bookmarks = self._load_bookmarks()
         bm = bookmarks.get(path)
-        if not bm:
+        # ISSUE-024 fix: the entry itself must be a dict.
+        if not isinstance(bm, dict) or not bm:
             return False
         page = bm.get("page", 0)
         sentence_idx = bm.get("sentence_idx", 0)
+        # ISSUE-024 fix: persisted values are untrusted — require ints so a
+        # corrupted/hand-edited file cannot raise TypeError in a GUI callback,
+        # and clamp negatives (a negative sentence_idx would otherwise index
+        # sentences from the END of the page via Python negative indexing).
+        if not isinstance(page, int) or not isinstance(sentence_idx, int):
+            log.warning("Bookmark for %s has non-int page/sentence_idx (%r); ignoring",
+                        path, bm)
+            return False
+        page = max(0, page)
         log.info("Bookmark found for %s: page=%d sentence_idx=%d (doc has %d pages)",
                  path, page, sentence_idx, self._pdf.page_count)
         if page >= self._pdf.page_count:
@@ -538,16 +579,24 @@ class DocumentReaderApp(ctk.CTk):
             # ISSUE-009 fix: clamp sentence_idx to valid range so a stale
             # bookmark (e.g. PDF was re-saved with fewer sentences) does not
             # silently skip playback by starting past the last sentence.
+            # ISSUE-024 fix: clamp the lower bound too (negative values).
             max_idx = max(0, len(self._sentences) - 1)
-            if sentence_idx > max_idx:
+            clamped = max(0, min(sentence_idx, max_idx))
+            if clamped != sentence_idx:
                 log.warning("Bookmark sentence_idx=%d clamped to %d (page has %d sentences)",
-                            sentence_idx, max_idx, len(self._sentences))
-                sentence_idx = max_idx
-            self._sentence_idx = sentence_idx
+                            sentence_idx, clamped, len(self._sentences))
+            self._sentence_idx = clamped
         return True
 
     def on_close(self):
-        log.info("Window closing; saving bookmark and tearing down")
+        log.info("Window closing; saving bookmark and tearing down "
+                 "(reading=%s, paused=%s, idx=%d)",
+                 self._reading, self._paused, self._sentence_idx)
+        # ISSUE-020 fix: apply the same ISSUE-007 rewind as _pause/_stop —
+        # when closing mid-sentence, _sentence_idx points at the NEXT
+        # sentence, so rewind by one to bookmark the interrupted one.
+        if self._reading and not self._paused and self._sentence_idx > 0:
+            self._sentence_idx -= 1
         self._save_bookmark()
         self._tts.stop()
         self._pdf.close()

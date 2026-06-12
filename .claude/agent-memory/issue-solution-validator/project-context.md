@@ -7,7 +7,7 @@ metadata:
 
 ## Stack
 - Python 3.14, Windows 11
-- GUI: `customtkinter` (cannot be imported headlessly — avoid importing `src.app` in tests without stubs)
+- GUI: `customtkinter` (cannot be imported headlessly — avoid importing `src.app` in tests without stubs; note: importing `src.app` for `inspect.getsource` works fine in this environment, just never instantiate the app)
 - PDF: `PyMuPDF` (fitz) — patchable with `unittest.mock.patch("fitz.open")`
 - Online TTS: `edge-tts` (async)
 - Offline TTS: `pyttsx3` (Windows SAPI5 COM)
@@ -15,23 +15,25 @@ metadata:
 
 ## Test Infrastructure
 - Test runner: `python -m unittest` (pytest not installed)
-- Test file: `tests/test_issue_validations.py` (70 tests as of 2026-06-02)
-- Tests use code inspection (`inspect.getsource`) as the primary mechanism — no live GUI, MCI, or TTS
+- Test file: `tests/test_issue_validations.py` (109 tests as of 2026-06-12; all green)
+- Tests mix code inspection (`inspect.getsource`) with behavioral tests built on `Class.__new__` + stubbed attributes — no live GUI, MCI, or TTS
 - `ctypes.WinDLL` is patched at module level in the test file before `src.audio_player` is imported
-- `src.tts_engine` is NOT imported at test module level — tests that use `sys.modules["src.tts_engine"]` must either do an explicit `import src.tts_engine` or call a setUp that does (see ISSUE-002 note)
+- Behavioral AudioPlayer tests: patch module-level `ap._mci = MagicMock(return_value=0)` and `ap._mci_query = MagicMock(return_value="stopped")`, then `player.play(...)` runs the real monitor loop which exits quickly on "stopped"
+- Behavioral TTSEngine tests: `_make_tts_engine()` helper in the test file builds via `TTSEngine.__new__` with `_player=MagicMock()`, real locks/events/queue, and no worker thread — then `_speak_online`/`_speak_offline` can be exercised directly (override `_edge_synthesize` with an async stub gated on a `threading.Event`)
+- Behavioral app-method tests: `DocumentReaderApp.__new__(DocumentReaderApp)` + set only the attributes the method touches; patch `app_mod.mb.askyesno` and `_load_bookmarks`/`_BOOKMARKS_FILE` as needed
 
-## Known Test Infrastructure Defect (2026-06-02)
-Tests `test_cleanup_tmp_acquires_lock` and `test_cleanup_runs_after_player_stop` (ISSUE-002 class) access `sys.modules["src.tts_engine"]` without an explicit import, and run alphabetically before `test_delete_tmp_acquires_lock` which does the first explicit import. This causes `KeyError: 'src.tts_engine'` on both tests. The fix is confirmed correct by manual inspection — these are test bugs, not code bugs.
-
-**Why:** The test class `TestIssue002TmpFileLock` has no `setUp` that imports `src.tts_engine`. The `_make_engine()` helper uses `patch("src.tts_engine.TTSEngine._pyttsx3_worker")` which populates `sys.modules`, but `_make_engine()` is not called from `setUp()`.
+## Former Test Infrastructure Defect — FIXED 2026-06-12
+The two `KeyError: 'src.tts_engine'` errors in `TestIssue002TmpFileLock` were fixed by adding a `setUp` that does `import src.tts_engine  # noqa: F401`. Suite has been 0-failure/0-error since.
 
 ## Key Files
-- `main.py` — entry point, logging setup
+- `main.py` — entry point, logging setup; wires `app.protocol("WM_DELETE_WINDOW", app.on_close)` (line ~37)
 - `src/app.py` — `DocumentReaderApp` GUI class
 - `src/pdf_reader.py` — `PDFReader` class
 - `src/voice_manager.py` — `VoiceManager`, `Voice` dataclass
-- `src/tts_engine.py` — `TTSEngine` (routes to edge-tts or pyttsx3 worker)
-- `src/audio_player.py` — `AudioPlayer` MCI wrapper; module-level `_mci_worker` thread
+- `src/tts_engine.py` — `TTSEngine` (generation-token cancellation `_generation`/`_gen_lock`; pyttsx3 worker; edge-tts with 30s `asyncio.wait_for`)
+- `src/audio_player.py` — `AudioPlayer` MCI wrapper; module-level `_mci_worker` dispatcher thread with 5s caller timeouts; monitor fires on_done on a detached "on-done-dispatch" thread
 
 ## Issues File
 - `issues.md` in project root — tracks all issues found by `bug-detective`, fixed by `issue-fixer`, validated by this agent
+- Sort rule (header line): OPEN → NEEDS_REVIEW → FIXED → PARTIAL → VALIDATED; entries are separated by lines that are exactly `---`, so the file can be safely re-sorted by splitting on `\n---\n` (verified: no section body contains a bare `---` line)
+- As of 2026-06-12: 4 OPEN (027-030, filed by validator), 1 NEEDS_REVIEW (016), 2 PARTIAL (011, 025), 23 VALIDATED

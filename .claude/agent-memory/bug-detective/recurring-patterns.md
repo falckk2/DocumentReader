@@ -17,6 +17,12 @@ Recurring bug classes in this codebase (check these first):
 
 5. **Fragile text matching for highlight.** `_highlight_sentence` searches `sentence[:40]` from doc start every time, mis-highlighting duplicates (ISSUE-005). No sentence→offset map exists.
 
+6. **Shared-Event set-then-clear cancellation.** `TTSEngine.speak()` sets then immediately clears the single shared `_stop_event`; in-flight synth threads that captured "the same object as a snapshot" get un-cancelled and resurrect (ISSUE-017, online play hijack + offline stale on_done). Pause has no engine-level flag at all, so in-flight synth plays during pause (ISSUE-019). Any cancellation check against `self._stop_event` is suspect — look for a per-utterance generation token instead.
+
+7. **Fix duplicated at call sites misses a site.** The ISSUE-007 idx rewind was copied into `_pause` and `_stop` but missed `on_close` (ISSUE-020), and the ISSUE-009 clamp only bounds the upper end (negative idx passes, ISSUE-024). When validating a fix that is "apply X at every place Y happens", grep for ALL sites of Y (e.g. every `_save_bookmark()` caller).
+
+8. **Unbounded blocking on the GUI thread.** `_mci()` waits forever on the dispatcher queue (ISSUE-026); `stop()` joins the monitor for 2s while the monitor can be blocked in a cross-thread Tk marshal (ISSUE-022); edge-tts synth has no network timeout (ISSUE-023). Any `.get()`/`.join()`/await without a timeout that the GUI thread can reach is a freeze candidate.
+
 **Why:** The app glues several single-threaded/COM libraries (Tk, SAPI5, MCI) behind an async-ish sentence pump; the seams between them are where bugs cluster.
 
 **How to apply:** Before deep-diving a new report, map it to one of these five buckets — most issues are a variant of one.

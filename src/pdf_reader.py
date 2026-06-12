@@ -12,19 +12,24 @@ class PDFReader:
 
     def open(self, path: str) -> int:
         """Open a PDF file. Returns total page count."""
-        if self._doc:
-            self._doc.close()
-        self._doc = fitz.open(path)
-        self._path = path
+        # ISSUE-021 fix: open the new document into a local first and only
+        # tear down the old one on success, so a failed open (missing/corrupt
+        # file or encrypted PDF) leaves any previously open document — and
+        # is_open/page_count — fully usable instead of pointing at a closed doc.
+        new_doc = fitz.open(path)
         # ISSUE-015 fix: detect password-protected PDFs and raise a clear
         # error rather than silently returning empty text for every page.
-        if self._doc.is_encrypted:
-            self._doc.close()
-            self._doc = None
+        if new_doc.is_encrypted:
+            new_doc.close()
             raise ValueError(
                 "This PDF is password-protected. "
                 "Encrypted PDFs are not currently supported."
             )
+        if self._doc:
+            log.debug("Closing previously open document %s", self._path)
+            self._doc.close()
+        self._doc = new_doc
+        self._path = path
         log.info("PDFReader opened %s (%d pages)", path, len(self._doc))
         return len(self._doc)
 

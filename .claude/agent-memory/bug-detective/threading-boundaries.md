@@ -18,6 +18,9 @@ DocumentReader runs three+ thread contexts that interact dangerously:
 - `_stop_pyttsx3` calls `engine.stop()` from the GUI thread while `runAndWait()` blocks the synth thread — COM cross-thread hazard. (ISSUE-013)
 - `AudioPlayer.stop()` joins `_monitor_thread`; if ever called from that thread it raises RuntimeError. (ISSUE-001)
 
+- `event_generate` from a background thread is thread-safe but BLOCKING: tkinter marshals it to the main thread and the caller waits until the mainloop dispatches it. If the GUI thread is simultaneously blocked (e.g. `AudioPlayer.stop()` joining the monitor thread that is inside `event_generate`), you get a lock-step stall broken only by the join timeout — 2s GUI freeze (ISSUE-022).
+- pyttsx3 worker (ISSUE-013 fix) is a single command-queue thread; while blocked in `runAndWait` it cannot process "stop" commands, so offline Stop/Pause cannot interrupt the current sentence (ISSUE-018).
+
 **Why:** Tk's only documented thread-safe cross-thread call is `event_generate`. Everything else must marshal through it or `after` from the GUI thread only.
 
 **How to apply:** When reviewing any callback whose name contains `_on_*_done` or any code inside a `threading.Thread(target=...)`, assume it is NOT on the GUI thread and flag any direct widget/`after`/shared-mutable access.

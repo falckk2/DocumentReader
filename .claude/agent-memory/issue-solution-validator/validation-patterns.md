@@ -33,6 +33,19 @@ Test `test_restore_bookmark_clamps_sentence_idx` checks for `'min('` in source. 
 4. Supplement with direct Python inspection: `python -c "from src.X import Y; import inspect; print(inspect.getsource(Y.method))"` 
 5. For logic correctness (clamping, arithmetic), write explicit equivalence test cases in the analysis
 
+## Recurring Defect Families (2026-06-12 session)
+- **Set-then-cleared shared Event** = resurrection bug. Fixed in TTSEngine via generation token (ISSUE-017), but the same pattern still lives in `AudioPlayer._stop_event` across `play()` calls (filed as ISSUE-028). When validating any cancellation fix here, grep for `.clear()` on shared events.
+- **Check-then-act residuals**: token/flag checks done outside a lock and not re-checked at the final action (e.g. gen check vs `_player.play()` handoff — ISSUE-027; `_done_and_cleanup` not gen-gated). A token fix can be correct for the filed bug while leaving a microsecond TOCTOU — validate the filed repro, then file the residual as a NEW low-severity issue rather than failing the fix.
+- **`on_close` is the chronic miss site for bookmark semantics**: ISSUE-020 (missed rewind) and ISSUE-030 (unconditional save clobbers Stop-saved position and resurrects completion-cleared bookmarks). Any bookmark-related fix must be checked against the close-the-window path — it undermined the otherwise-correct ISSUE-025 fix (marked PARTIAL because the issue's own repro "finish → close → reopen" still failed for multi-page docs).
+- **Recovery paths need guarding too**: ISSUE-026's `except` handler's own `result_q.put` can raise (ISSUE-029). When a fix adds an error handler, check whether the handler itself can throw.
+
+## Validating Multi-Issue Fix Batches (what worked 2026-06-12)
+- Trace *interactions* between fixes, not just each fix in isolation: pause() bumping the generation (ISSUE-019) could plausibly have broken resume-after-real-pause — it doesn't, because the gen gate applies only at the pre-play handoff; the on_done of an already-playing track is not gated. Writing out the full event sequence for each user flow (pause→resume, stop→play, finish→close→reopen) is what surfaced ISSUE-030.
+- pyttsx3 callbacks (`started-word`) are invoked with **kwargs on the thread running `runAndWait` — an in-worker `engine.stop()` from the callback preserves the single-owner COM constraint (ISSUE-013) by construction.
+- Python ≥3.11: `asyncio.TimeoutError is TimeoutError` (builtin, an Exception subclass), so `except Exception` catches `asyncio.wait_for` timeouts.
+- Lock-free reads of an int token in CPython are fine (GIL-atomic) as long as all writes are serialized under a lock — don't fail a fix for not locking reads.
+- Re-sorting issues.md: split on `\n---\n`, map sections by `## ISSUE-(\d+)`, reassemble in explicit desired order, assert same length before writing. Safe and fast.
+
 ## Status Values
 - `VALIDATED ✅` — fix confirmed correct, issue resolved
 - `PARTIAL ⚠️` — known remaining gap documented, partial fix is correct

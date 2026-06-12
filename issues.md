@@ -1,8 +1,80 @@
 # Issues Log
 
-_Last updated: 2026-06-03_
+_Last updated: 2026-06-12_
 
-Issues are sorted by status: NEEDS_REVIEW → PARTIAL → VALIDATED. Append new issues at the appropriate status group; never delete old entries (change Status instead).
+Issues are sorted by status: OPEN → NEEDS_REVIEW → FIXED → PARTIAL → VALIDATED. Append new issues at the appropriate status group; never delete old entries (change Status instead).
+
+---
+
+## ISSUE-027 — TOCTOU window between the generation check and `_player.play()` in `_speak_online`
+
+**Status**: OPEN
+**Severity**: LOW
+
+### Discovery
+- **File**: `src/tts_engine.py` — `_speak_online._run` (`if gen == self._generation:` → `self._player.play(tmp, ...)`)
+- **Description**: The ISSUE-017 generation gate is a check-then-act: nothing prevents `stop()`/`pause()` from running *between* the synth thread's `gen == self._generation` check and its `self._player.play(tmp)` call. A Stop landing in that microsecond window completes fully (generation bumped, player stopped, `_cleanup_tmp` deletes `tmp`), after which the stale synth thread still calls `play()`. Usually the MCI open then fails (file deleted) and `play()` fires `on_done` inline → `_done_and_cleanup` → app `_on_sentence_done`, which suppresses it via the `_reading` re-check — but if the user has already pressed Play again (`_reading` True), a stale `on_done` advances the new read; and if cleanup loses the file-delete race, the cancelled audio can briefly play with nothing left to stop it.
+- **Root Cause**: The generation token is verified outside `_gen_lock` and not held across the handoff to the player; `_done_and_cleanup` does not re-check the generation when it fires.
+- **Impact**: Worst case one skipped sentence or a brief rogue audio start, only when Stop lands in a microsecond window. Vastly narrower than the deterministic resurrection ISSUE-017 fixed.
+- **Reproduction**: Not practically reproducible by hand; requires instrumented thread interleaving.
+- **Depends On**: ISSUE-017 (residual of its fix design)
+- **Fix Suggestion**: Re-check `gen == self._generation` inside `_done_and_cleanup` before calling `on_done()`; optionally hold `_gen_lock` across the check-and-play handoff (bumps then serialize against the handoff).
+- **Logging Added**: None (existing gen-tagged DEBUG lines already identify the interleaving).
+- **Date Found**: 2026-06-12 (by issue-solution-validator during ISSUE-017 validation)
+
+---
+
+## ISSUE-028 — `AudioPlayer._stop_event` set-then-cleared across `play()` calls; monitor resurrection if the 2s join times out
+
+**Status**: OPEN
+**Severity**: LOW
+
+### Discovery
+- **File**: `src/audio_player.py` — `play()` (`self.stop()` then `self._stop_event.clear()`), `_monitor` exit (`cb = self._on_done if not self._stop_event.is_set() else None`), `stop()` (`join(timeout=2.0)`)
+- **Description**: The player has the same shared set-then-cleared event pattern that ISSUE-017 removed from `TTSEngine`. `play()` calls `stop()` (sets `_stop_event`, joins the old monitor) and then clears the event. The join is the only guard: if it ever times out (e.g., the MCI dispatcher stalls — now bounded at 5s per query by ISSUE-026, still > the 2s join), the old monitor survives into the new utterance, sees the **cleared** event and the **reassigned** `self._on_done`, and fires the new utterance's callback early — a double `on_done`/sentence skip. The ISSUE-022 fix text explicitly notes the join is retained as this guard; it is a timeout-based guard, not a structural one.
+- **Root Cause**: Cancellation state and the `on_done` slot are shared across `play()` generations instead of being per-playback.
+- **Impact**: Speculative double-advance; requires a >2s MCI stall coinciding with a new `play()`. LOW.
+- **Reproduction**: Stall the MCI dispatcher >2s (e.g., breakpoint in `_mci_worker`) while pressing Stop then Play.
+- **Depends On**: ISSUE-022, ISSUE-026
+- **Fix Suggestion**: Mirror the ISSUE-017 design inside `AudioPlayer`: a per-play generation token (or a fresh `threading.Event` and `on_done` captured per `play()` and passed to the monitor closure) so a leftover monitor can never observe the new utterance's state.
+- **Logging Added**: None (the existing "Monitor thread did not exit within 2s join timeout" WARNING is the signature).
+- **Date Found**: 2026-06-12 (by issue-solution-validator during ISSUE-022 validation)
+
+---
+
+## ISSUE-029 — `_mci_worker` failure handler can itself raise, killing the dispatcher despite the ISSUE-026 guard
+
+**Status**: OPEN
+**Severity**: LOW
+
+### Discovery
+- **File**: `src/audio_player.py` — `_mci_worker` (`except Exception:` → `result_q.put((-1, ""))`)
+- **Description**: The ISSUE-026 per-command guard assumes `result_q` is a usable Queue. A malformed item that *does* unpack into two elements (e.g. `("cmd", "not-a-queue")`) reaches the execute block; when `result_q.put(...)` raises `AttributeError`, control enters `except Exception`, whose own `result_q.put((-1, ""))` raises again — uncaught — and the dispatcher thread dies. The non-tuple malformed case is handled; this two-element case is not. The ISSUE-026 caller timeouts bound the damage (each later call degrades to a 5s wait + error return instead of a permanent freeze), so this is a robustness gap, not a freeze.
+- **Root Cause**: The recovery path (`result_q.put` in the except handler) is not itself guarded.
+- **Impact**: Dispatcher death → all subsequent MCI calls return -1/"" after a 5s delay each; audio playback dead until restart. Requires a caller bug placing a malformed 2-element item; speculative.
+- **Reproduction**: `_cmd_queue.put(("status x mode", "oops"))` — worker thread exits on the second raise.
+- **Depends On**: ISSUE-026
+- **Fix Suggestion**: Wrap the except-handler's `result_q.put((-1, ""))` in its own `try/except Exception: pass`, and/or validate `isinstance(result_q, queue.Queue)` alongside the unpack guard.
+- **Logging Added**: None (existing `log.exception` lines cover the first raise).
+- **Date Found**: 2026-06-12 (by issue-solution-validator during ISSUE-026 validation)
+
+---
+
+## ISSUE-030 — `on_close` saves a bookmark unconditionally: clobbers the Stop-saved position and resurrects bookmarks cleared on completion
+
+**Status**: OPEN
+**Severity**: LOW
+
+### Discovery
+- **File**: `src/app.py` — `on_close()` (`self._save_bookmark()` with no state check); interacts with `_stop()` (resets `_sentence_idx = 0` after saving) and `_clear_bookmark()` (ISSUE-025)
+- **Description**: `on_close` always calls `_save_bookmark()` when a PDF is open, regardless of playback state. Two bad interactions: (1) **Stop-then-close clobber** — manual `_stop()` saves the rewound interrupted-sentence index, then resets `_sentence_idx = 0`; closing afterwards re-saves `{page: current, sentence_idx: 0}`, overwriting the good bookmark (resume points at sentence 1 of the page instead of the interrupted sentence). (2) **Completion resurrection** — after "Finished reading document.", `_clear_bookmark()` (ISSUE-025) deletes the entry, but `_stop(completed=True)` leaves `_current_page` at the last page; closing re-saves `{page: last, sentence_idx: 0}`, so the next open of a multi-page document shows a stale "Resume from page N, sentence 1?" prompt — the very symptom ISSUE-025 set out to remove (single-page docs are unaffected because page 0 / sentence 0 skips the prompt).
+- **Root Cause**: `on_close` cannot distinguish "closing mid-read" (must save) from "closing while idle/after completion" (must not overwrite/recreate); no completion state survives `_stop(completed=True)`.
+- **Impact**: Sentence position lost on Stop→close; stale resume prompt after finishing a multi-page document. Cosmetic/annoying; no data loss beyond one sentence index.
+- **Reproduction**: (1) Play, Stop mid-page, close, reopen → resume offers sentence 1, not the interrupted sentence. (2) Read a multi-page doc to the end, close, reopen → stale resume prompt for the last page.
+- **Depends On**: ISSUE-025 (its completion-path fix is undermined by path 2)
+- **Fix Suggestion**: Track state, e.g. set `self._completed = True` in `_on_page_done`'s document-end branch (cleared on `_play`/`_open_pdf`) and have `on_close` skip saving when `_completed`; and only save from `on_close` when `self._reading or self._paused` (idle close has nothing new to record — `_stop` already saved).
+- **Logging Added**: None (the `on_close` INFO line plus `_save_bookmark` DEBUG already show the overwrite).
+- **Date Found**: 2026-06-12 (by issue-solution-validator during ISSUE-025 validation)
 
 ---
 
@@ -57,6 +129,43 @@ Issues are sorted by status: NEEDS_REVIEW → PARTIAL → VALIDATED. Append new 
 - **Inspection**: `_monitor` (audio_player.py lines 101-140) polls every 0.1s, breaks on `status == "stopped"` as primary condition, and on `pos >= track_length` as backup with a drain loop. No MCI notify window (`HWND`, `MM_MCINOTIFY`, `WM_USER`) present in the codebase. This matches the stated partial resolution.
 - **Verdict**: Correctly marked as Partially Resolved. The polling mechanism is functionally correct; the known gap (audible inter-sentence gaps from polling latency) remains for a future `MM_MCINOTIFY` implementation.
 - **New Issues**: None
+
+---
+
+## ISSUE-025 — Finishing a page/document saves a bookmark at the already-read last sentence; never cleared on completion
+
+**Status**: PARTIAL ⚠️
+**Severity**: LOW
+
+### Discovery
+- **File**: `src/app.py` — `_on_page_done` else-branch (~lines 432-437) → `_stop()` (~lines 344-371)
+- **Description**: When the last sentence of a page (or the document) finishes naturally, `_on_page_done` calls `_stop()`. At that moment `_reading` is True and `_sentence_idx == len(_sentences)`, so the ISSUE-007 rewind fires and `_save_bookmark` persists `sentence_idx = len(_sentences) - 1` — the last sentence, which was **just read to completion**. After "Finished reading document.", the next open of that PDF prompts "Resume from page N, sentence <last>?" and re-reads the final sentence of the final page. After "Page done." (no auto-advance), the saved position similarly points at the last already-read sentence instead of the next page.
+- **Root Cause**: The ISSUE-007 rewind assumes an *interrupted* sentence; on natural completion there is no interrupted sentence, but `_stop()` cannot distinguish the two cases. Completion also never clears the bookmark entry.
+- **Reproduction**: Read a short document to the end ("Finished reading document."), close, reopen — resume prompt offers the last sentence again.
+- **Impact**: Cosmetic/annoying: stale resume prompt and one redundant re-read after finishing. No data loss.
+- **Depends On**: None
+- **Fix Suggestion**: In `_on_page_done`: on document completion, delete the bookmark entry for `self._current_pdf_path` (write the bookmarks dict without that key) before calling `_stop()`; on page completion without auto-advance, save `{page: current+1, sentence_idx: 0}` semantics instead. Simplest mechanism: give `_stop()` a `completed: bool = False` parameter (or set a flag) that skips the rewind and clears/advances the bookmark.
+- **Logging Added**: None added — existing "Page N finished" INFO plus the `_save_bookmark` DEBUG already show the saved index equalling the last sentence.
+- **Date Found**: 2026-06-11
+
+### Fix
+- **Date**: 2026-06-11
+- **Changes**: In `src/app.py`: `_stop()` gained a `completed: bool = False` parameter (Stop button still passes nothing); when True, the ISSUE-007 rewind-and-save is skipped entirely. `_on_page_done`'s non-advance branch now distinguishes the two completion cases before calling `_stop(completed=True)`: on document completion it calls the new `_clear_bookmark()` (deletes the entry for `_current_pdf_path` and rewrites the file), so the next open shows no stale resume prompt; on page completion without auto-advance it calls `_save_bookmark(page=self._current_page + 1, sentence_idx=0)` so resume starts at the top of the next page. `_save_bookmark` accepts optional explicit `page`/`sentence_idx` overrides, and the file write was factored into a shared `_write_bookmarks()` helper. Tests: `TestIssue025CompletionBookmark` (5 tests, includes a behavioral `_clear_bookmark` round-trip).
+
+### Validation
+- **Date**: 2026-06-12
+- **Method**: Tests + code inspection
+- **Tests**: `tests/test_issue_validations.py::TestIssue025CompletionBookmark` — 5 tests
+- **Results**: 5 passed, 0 failed
+  - ✅ test_stop_accepts_completed_param
+  - ✅ test_stop_skips_rewind_when_completed
+  - ✅ test_page_done_clears_bookmark_on_document_end
+  - ✅ test_page_done_bookmarks_next_page_start
+  - ✅ test_clear_bookmark_removes_entry (behavioral round-trip)
+- **Inspection**: The implemented mechanics are all correct: `_stop(completed=True)` skips the rewind-and-save entirely (app.py:350); `_on_page_done` calls `_clear_bookmark()` on document completion and `_save_bookmark(page=self._current_page + 1, sentence_idx=0)` on page completion, both *before* `_stop(completed=True)` so nothing re-saves afterwards. The ISSUE-007 paths are not regressed: default `completed=False` keeps the rewind-and-save for manual Stop, `_pause` is untouched, and Stop-while-paused still avoids a double rewind. **However**, the issue's own reproduction (read to end → close → reopen) still fails for multi-page documents: `on_close` (wired via WM_DELETE_WINDOW) unconditionally calls `_save_bookmark()`, and after completion `_current_page` is still the last page with `_sentence_idx == 0`, so closing the window re-saves `{page: last, sentence_idx: 0}` — resurrecting the entry `_clear_bookmark()` just deleted and producing a stale "Resume from page N, sentence 1?" prompt on the next open. Single-page documents are unaffected (page 0 / sentence 0 skips the prompt), and the redundant re-read of the last *sentence* is fixed in all cases.
+- **Verdict**: Partially resolved. Completion handling inside the app session is correct and tested, but the close-after-completion path re-creates the bookmark, so the stale resume prompt — the issue's headline symptom — survives for multi-page documents.
+- **Remaining**: Make `on_close` completion-aware (e.g., a `_completed` flag set in `_on_page_done`'s document-end branch that suppresses the `on_close` save) — tracked as ISSUE-030, which also covers the related Stop-then-close clobber.
+- **New Issues**: ISSUE-030 (`on_close` saves unconditionally: clobbers the Stop-saved position and resurrects completion-cleared bookmarks)
 
 ---
 
@@ -553,6 +662,321 @@ Issues are sorted by status: NEEDS_REVIEW → PARTIAL → VALIDATED. Append new 
 - **Inspection**: `PDFReader.open()` (pdf_reader.py lines 21-29): checks `self._doc.is_encrypted`, closes the doc, sets `self._doc = None`, and raises `ValueError("This PDF is password-protected...")`. `get_page_text()` (lines 50-55): wraps `page.get_text("text")` in `try/except Exception` with `log.exception` and returns `""` on failure.
 - **Verdict**: Fix is confirmed correct and complete.
 - **New Issues**: None
+
+---
+
+## ISSUE-017 — Shared `_stop_event` set-then-cleared in `speak()` resurrects cancelled in-flight utterances
+
+**Status**: VALIDATED ✅
+**Severity**: HIGH
+
+### Discovery
+- **File**: `src/tts_engine.py` — `speak()` (stop at ~line 56, clear at ~line 60), `_speak_online` (`stop_event = self._stop_event` ~line 110, `if not stop_event.is_set()` post-synth check), `_pyttsx3_worker` on_done gate (`not self._stop_event.is_set()`)
+- **Description**: `speak()` calls `self.stop()` (which sets `self._stop_event`) and then immediately calls `self._stop_event.clear()`. Every in-flight synthesis path captured a reference to the **same** Event object — the comment in `_speak_online` claims a "snapshot", but `stop_event = self._stop_event` aliases the shared object. So a previously cancelled utterance is silently un-cancelled the moment a new `speak()` begins. Online: a synth thread for cancelled sentence N that finishes after the new `speak(M)` sees the event cleared and calls `self._player.play(tmp_N)` — `play()` internally calls `stop()`, killing utterance M's playback, and sentence N's audio plays while the app believes M is playing; two `_run` threads then fight over the single MCI alias and `on_done` can fire twice (double sentence advance). Offline: the pyttsx3 worker gates its `on_done` on `self._stop_event.is_set()`; a sentence that was cancelled with Stop but completes after a new `speak()` cleared the event fires a stale `on_done`, also double-advancing.
+- **Root Cause**: Cancellation is signalled through one shared `threading.Event` that is set and then immediately cleared per utterance, instead of a per-utterance token. Set-then-clear on a shared Event cannot cancel anything that checks the event after the clear.
+- **Reproduction**: Online voice on a slow network: press Stop while sentence N is synthesizing, then press Play within a couple of seconds. When N's synthesis completes, N plays (or kills the restarted sentence's playback) even though it was stopped. Offline: press Stop during a long sentence, press Play before `runAndWait` returns; N's `on_done` fires after completion, interleaving with the restarted read.
+- **Impact**: Wrong sentence audibly plays after Stop/Play; playback of the current sentence killed mid-word; double `on_done` causes skipped sentences and index drift. User-visible and reachable through normal rapid UI interaction.
+- **Depends On**: None
+- **Fix Suggestion**: Replace the shared-event check with a per-utterance generation token: increment `self._generation` in both `speak()` and `stop()` (under a lock); capture `gen = self._generation` when an utterance starts and verify `gen == self._generation` immediately before `self._player.play(...)` (online) and before firing `on_done` (offline worker). Alternatively allocate a **new** `threading.Event()` per utterance, store it as the "current" event, and have `stop()` set only the current one (never clear).
+- **Logging Added**: Added a diagnostic `_speak_seq` utterance counter (logging-only) in `TTSEngine.__init__`/`speak()`; `_speak_online._run` logs the utterance number at synth start/handoff and logs a WARNING when a stale utterance (seq mismatch) proceeds to play; `_pyttsx3_worker` logs the current utterance number when firing `on_done`.
+- **Date Found**: 2026-06-11
+
+### Fix
+- **Date**: 2026-06-11
+- **Changes**: Replaced the shared set-then-cleared `_stop_event` with a per-utterance generation token in `src/tts_engine.py`: new `_generation` counter + `_gen_lock`, bumped via `_bump_generation()` in `stop()` (and `pause()` for ISSUE-019). `_speak_online` captures `gen = self._generation` at utterance start and verifies `gen == self._generation` before handing the MP3 to the player — stale runs delete their tmp file and exit without playing or firing `on_done` (the synth-failure path's `on_done` is generation-gated too). `_speak_offline` wraps `on_done` in a generation-gated closure (queue tuple format `("speak", text, voice_id, rate_wpm, on_done)` unchanged), so a sentence completing after stop/pause/a newer `speak()` can never fire a stale `on_done`. Removed `_stop_event` from `TTSEngine` and the diagnostic `_speak_seq` counter; the stale-utterance WARNING (now unreachable) was replaced by a DEBUG "discarding stale utterance" line on the correct cancel path. Tests: `TestIssue017GenerationToken` (7 tests, includes behavioral stale/current cases for both backends) in `tests/test_issue_validations.py`.
+
+### Validation
+- **Date**: 2026-06-12
+- **Method**: Tests + code inspection
+- **Tests**: `tests/test_issue_validations.py::TestIssue017GenerationToken` — 8 tests (the Fix note says 7; there are 8)
+- **Results**: 8 passed, 0 failed
+  - ✅ test_generation_initialized_in_init
+  - ✅ test_stop_bumps_generation
+  - ✅ test_speak_online_captures_and_checks_generation
+  - ✅ test_no_stop_event_clear_in_speak
+  - ✅ test_stale_offline_on_done_suppressed (behavioral)
+  - ✅ test_current_offline_on_done_fires (behavioral)
+  - ✅ test_stale_online_synth_discarded (behavioral)
+  - ✅ test_current_online_synth_plays (behavioral)
+- **Inspection**: `_gen_lock`/`_generation` created in `__init__` (tts_engine.py:29-30); `_bump_generation()` increments under the lock; `stop()` and `pause()` both bump; `speak()` calls `stop()` and clears nothing — no `.clear()` and no `_stop_event` attribute remains anywhere in `TTSEngine`, so resurrection is structurally impossible. `_speak_online` captures `gen` before the synth thread starts, checks it before `play()` and gates the synth-failure `on_done` (line 157); the stale branch deletes the tmp file without playing or firing `on_done`. `_speak_offline` wraps `on_done` in a generation-gated closure. Generation reads are lock-free, which is safe in CPython (GIL-atomic int attribute reads); all writes are serialized under `_gen_lock`, so no increment can be lost.
+- **Verdict**: Fix is correct and complete — the deterministic set-then-clear resurrection is eliminated for both backends, confirmed behaviorally. A microsecond-scale check-then-act residual exists but is a distinct, far narrower defect (filed separately).
+- **New Issues**: ISSUE-027 (TOCTOU between the generation check and `_player.play()`; `_done_and_cleanup` does not re-check the generation)
+
+---
+
+## ISSUE-018 — Offline (pyttsx3) playback cannot be interrupted mid-sentence: Stop is queued behind `runAndWait`, Pause sends nothing
+
+**Status**: VALIDATED ✅
+**Severity**: MEDIUM
+
+### Discovery
+- **File**: `src/tts_engine.py` — `stop()` (queue put of `("stop", ...)` ~line 86), `_pyttsx3_worker` (`runAndWait()` blocking the only thread that processes "stop"), `pause()` (~lines 64-75, no offline branch); `src/app.py` — `_pause()` (only calls `self._tts.pause()`)
+- **Description**: The ISSUE-013 fix made the pyttsx3 worker single-threaded: `engine.stop()` is only ever called when the worker processes a `("stop", ...)` command from its queue. But while the worker is blocked inside `engine.runAndWait()` for the current sentence, it cannot dequeue anything — so pressing Stop has **no audible effect until the current offline sentence finishes naturally**. Worse, `TTSEngine.pause()` does nothing at all for offline voices: it only pauses the MCI player (which is idle in offline mode) and does not even enqueue a stop. The in-code comment claims "the app layer handles offline pause by stopping and then re-queuing the sentence", but `DocumentReaderApp._pause()` only calls `self._tts.pause()` — no stop is issued anywhere on the offline pause path. The current sentence keeps speaking after Pause is pressed; only the *next* sentence is suppressed (via the `_paused` check in `_on_sentence_done`).
+- **Root Cause**: Single-worker command-queue design serializes the interrupt behind the very call it is meant to interrupt; `pause()` has an online-only implementation with a stale comment describing app-layer behavior that does not exist.
+- **Reproduction**: Select an `[Offline]` voice, play a page with a long sentence, press Stop (or Pause) mid-sentence — audio continues to the end of the sentence.
+- **Impact**: Stop/Pause appear broken for offline voices during long sentences. Combined with ISSUE-017, the completed-anyway sentence can also fire a stale `on_done`.
+- **Depends On**: ISSUE-017 (a per-utterance token would also make the late-completing sentence's `on_done` safely discardable)
+- **Fix Suggestion**: Use pyttsx3 engine callbacks to interrupt from inside the worker thread: register `engine.connect('started-word', cb)` where `cb` checks an `threading.Event` interrupt flag and calls `engine.stop()` (the callback runs on the worker thread inside `runAndWait`, so no cross-thread COM call — preserving the ISSUE-013 constraint). Set that flag from `TTSEngine.stop()` *and* `pause()`. Also fix the stale comment in `pause()` or implement the described stop-and-requeue behavior in the app layer.
+- **Logging Added**: `TTSEngine.stop()` logs the pyttsx3 queue depth when the stop command is enqueued (a depth > 1 while audio continues confirms the stuck command); the worker logs when it actually processes a stop; `TTSEngine.pause()` logs player state showing the offline no-op.
+- **Date Found**: 2026-06-11
+
+### Fix
+- **Date**: 2026-06-11
+- **Changes**: Added `_pyttsx3_interrupt` (threading.Event) in `src/tts_engine.py`. `stop()` and `pause()` set it; the worker clears it at the start of each new utterance and registers a pyttsx3 `started-word` callback (connected once at engine init, bound to the engine instance via a default arg) that calls `engine.stop()` from inside `runAndWait` when the flag is set — interrupting offline speech at the next word boundary with no cross-thread COM call (ISSUE-013 constraint preserved). The queued `("stop", ...)` command is retained as a belt-and-braces in-worker stop. The worker's `on_done` gate now checks the interrupt flag instead of the removed `_stop_event` (and `on_done` itself is generation-gated per ISSUE-017). The stale "app layer handles offline pause" comment in `pause()` was removed; offline Pause now actually interrupts mid-sentence and the app's existing resume path re-speaks the rewound sentence. Obsolete queue-depth/no-op diagnostic logs removed. Tests: `TestIssue018OfflineInterrupt` (5 tests).
+
+### Validation
+- **Date**: 2026-06-12
+- **Method**: Tests + code inspection
+- **Tests**: `tests/test_issue_validations.py::TestIssue018OfflineInterrupt` — 5 tests; regression guard via `TestIssue013PyttxWorker` (7 tests, incl. test_queue_command_format)
+- **Results**: 12 passed, 0 failed
+  - ✅ test_stop_sets_interrupt_event (behavioral)
+  - ✅ test_pause_sets_interrupt_event (behavioral)
+  - ✅ test_worker_connects_started_word_callback
+  - ✅ test_worker_callback_checks_interrupt
+  - ✅ test_worker_clears_interrupt_per_utterance
+  - ✅ all 7 ISSUE-013 worker tests still pass — no regression
+- **Inspection**: `_pyttsx3_interrupt` (threading.Event) is created in `__init__`, set by both `stop()` and `pause()`, and cleared by the worker at the start of each new "speak" command (tts_engine.py:223) — so a flag set for a cancelled sentence cannot leak into the next one (command ordering guarantees this: every `speak()` enqueues its "speak" after the `stop()` that set the flag). The `started-word` callback is connected once per engine instance inside the `if engine is None` init block, bound via default arg `_eng=engine` (re-connected correctly when the engine is re-initialized after a failure), and calls `_eng.stop()` on the worker thread from inside `runAndWait` — no cross-thread COM call, so ISSUE-013's single-owner constraint is preserved; the queued `("stop", ...)` belt-and-braces path also stops only from the worker thread. Queue tuple format `("speak", text, voice_id, rate_wpm, on_done)` is unchanged. The worker's `on_done` gate (`not pending_stop and not self._pyttsx3_interrupt.is_set()`) plus the ISSUE-017 generation gate in `_speak_offline` prevent an interrupted sentence from advancing the reader.
+- **Verdict**: Fix is correct and complete. Offline Stop/Pause now interrupt at the next word boundary with no ISSUE-013 regression; interruption granularity (word boundary, not instant) matches the documented design.
+- **New Issues**: None
+
+---
+
+## ISSUE-019 — Pause during in-flight online synthesis is ignored: audio starts playing while the app is paused, then replays on resume
+
+**Status**: VALIDATED ✅
+**Severity**: MEDIUM
+
+### Discovery
+- **File**: `src/tts_engine.py` — `pause()` (~lines 64-75), `_speak_online._run` (post-synth check tests only `stop_event`); `src/app.py` — `_pause()` (~lines 329-342), `_play()` resume path (~lines 298-314)
+- **Description**: `TTSEngine.pause()` only calls `self._player.pause()` if the player is already playing. If the user presses Pause while the online synthesis for the next sentence is still in flight (network latency window, which can be hundreds of ms to seconds), nothing is paused and nothing records the pause for the synth thread to observe: when synthesis completes, `_run` checks only `stop_event` (not set — pause never sets it) and calls `self._player.play(tmp)`. The sentence audibly plays while the UI shows the paused state (Resume button visible, Pause disabled). Because `_pause()` also rewound `_sentence_idx` (ISSUE-007 fix), pressing Resume re-reads the same sentence — the user hears it twice. If the user presses Resume *while* the rogue audio is still playing, `_play()` sees `is_playing == True`, skips the re-read, and playback continues but the rewound index means the just-played sentence is spoken again on the next advance.
+- **Root Cause**: Pause state lives only in the MCI player; the engine has no pause flag that in-flight synthesis threads consult before starting playback.
+- **Reproduction**: Online voice on a slow connection; press Pause immediately after a sentence begins (during the synth phase, before audio starts). The sentence starts playing anyway.
+- **Impact**: Audio plays during "paused" state; sentence heard twice after resume; UI state and audio state disagree.
+- **Depends On**: ISSUE-017 (the same per-utterance token / engine-level state would be the natural place to gate this)
+- **Fix Suggestion**: Add an engine-level `self._pause_event` (threading.Event) set in `pause()` and cleared in `resume()`/`speak()`; in `_speak_online._run`, after synthesis check `if stop_event.is_set() or self._pause_event.is_set():` and discard (delete tmp, do not play, do not call `on_done`). Alternatively, in `app._pause()`, when `not self._tts.is_playing` (synthesis in flight), call `self._tts.stop()` instead of `pause()` — the rewound `_sentence_idx` already makes resume re-speak correctly.
+- **Logging Added**: `TTSEngine.pause()` now logs player playing/paused state at pause time; a "pause: player_playing=False" line followed by "synth done, handing to player" confirms this issue at runtime.
+- **Date Found**: 2026-06-11
+
+### Fix
+- **Date**: 2026-06-11
+- **Changes**: `TTSEngine.pause()` in `src/tts_engine.py` now bumps the per-utterance generation token (the ISSUE-017 mechanism, per the dependency noted in Discovery). An online synthesis still in flight at pause time fails its generation check on completion and discards the result — tmp file deleted, no playback, no `on_done` — instead of audibly playing while the UI shows the paused state. The app's existing resume path (`_play`: `not self._tts.is_playing` → `_read_next_sentence()`) re-speaks the rewound sentence, so nothing is lost or heard twice. `pause()` still pauses the MCI player when audio is actually playing. Tests: `TestIssue019PauseGatesInFlightSynth` (3 tests, includes a behavioral pause-during-synth case).
+
+### Validation
+- **Date**: 2026-06-12
+- **Method**: Tests + code inspection
+- **Tests**: `tests/test_issue_validations.py::TestIssue019PauseGatesInFlightSynth` — 3 tests
+- **Results**: 3 passed, 0 failed
+  - ✅ test_pause_bumps_generation
+  - ✅ test_pause_only_pauses_player_when_playing
+  - ✅ test_paused_in_flight_synth_does_not_play (behavioral: synth completing after pause() neither plays nor fires on_done)
+- **Inspection**: `TTSEngine.pause()` (tts_engine.py:69-79) bumps the generation first, then sets the pyttsx3 interrupt, then pauses the MCI player only when actually playing. An in-flight online synth fails the `gen == self._generation` check on completion and discards (tmp deleted, no play, no `on_done`) — the rogue-audio-while-paused and heard-twice symptoms are gone. Crucially, normal pause/resume of already-playing audio is NOT regressed: the generation gate applies only at the pre-play handoff, so the `_done_and_cleanup` callback of a track that was already handed to the player still fires after resume, advancing the reader correctly. The app resume path (`_play`: paused → `resume()`, then `not is_playing` → `_read_next_sentence()`) re-speaks the rewound sentence for the synth-in-flight case (ISSUE-006/007 paths intact).
+- **Verdict**: Fix is correct and complete. Pause during the synthesis window now discards the result, and both resume paths (mid-audio and mid-synth) behave correctly.
+- **New Issues**: None
+
+---
+
+## ISSUE-020 — `on_close` saves bookmark without the ISSUE-007 rewind, skipping the interrupted sentence next session
+
+**Status**: VALIDATED ✅
+**Severity**: MEDIUM
+
+### Discovery
+- **File**: `src/app.py` — `on_close()` (~lines 565-575)
+- **Description**: The ISSUE-007 fix rewinds `_sentence_idx` by one in `_pause()` and `_stop()` before saving, because the index is post-incremented before the sentence is actually spoken. `on_close()` calls `self._save_bookmark()` directly with no rewind. Closing the window mid-playback therefore persists the index of the **next** sentence; on the next session the resume prompt restores past the interrupted sentence, which is never read.
+- **Root Cause**: The rewind logic was duplicated into `_pause`/`_stop` but the third save site (`on_close`) was missed — the correction lives at the call sites instead of inside `_save_bookmark()`.
+- **Reproduction**: Play an online voice, close the window mid-sentence N, reopen the PDF and accept the resume prompt — reading starts at sentence N+1.
+- **Impact**: One sentence lost on every close-while-reading; identical user impact to ISSUE-007 through an uncovered path.
+- **Depends On**: None
+- **Fix Suggestion**: In `on_close()`, apply the same guard before saving: `if self._reading and not self._paused and self._sentence_idx > 0: self._sentence_idx -= 1`. Better long-term: move the rewind into `_save_bookmark()` (compute the effective index there based on `_reading`/`_paused`) so future save sites cannot miss it.
+- **Logging Added**: `on_close` now logs `reading`/`paused`/`idx` and notes the index is not rewound, so the off-by-one is visible in the final log lines of a session.
+- **Date Found**: 2026-06-11
+
+### Fix
+- **Date**: 2026-06-11
+- **Changes**: `on_close()` in `src/app.py` now applies the same guard as `_pause`/`_stop` before saving: `if self._reading and not self._paused and self._sentence_idx > 0: self._sentence_idx -= 1`. The obsolete "idx NOT rewound" diagnostic note was removed from the closing log line. Chose the call-site guard over moving the rewind into `_save_bookmark()` because `_pause`/`_stop` rewind *before* calling it — centralizing would double-rewind those paths. Tests: `TestIssue020CloseRewind` (2 tests).
+
+### Validation
+- **Date**: 2026-06-12
+- **Method**: Tests + code inspection
+- **Tests**: `tests/test_issue_validations.py::TestIssue020CloseRewind` — 2 tests
+- **Results**: 2 passed, 0 failed
+  - ✅ test_on_close_rewinds_sentence_idx
+  - ✅ test_rewind_happens_before_save
+- **Inspection**: `on_close()` (app.py:591-603) applies exactly the `_stop` guard — `if self._reading and not self._paused and self._sentence_idx > 0: self._sentence_idx -= 1` — before `_save_bookmark()`. Close-while-paused correctly skips the rewind (`_pause` already rewound and saved; the re-save persists the same index). `on_close` is wired via `app.protocol("WM_DELETE_WINDOW", app.on_close)` in main.py:37, so the path is actually reachable. The issue's reproduction (close mid-sentence N → reopen → resume at N) is satisfied: the saved index now names the interrupted sentence.
+- **Verdict**: Fix is correct and complete for the close-while-reading path this issue describes. (A separate defect in `on_close`'s idle-state save semantics was found while validating ISSUE-025 — see ISSUE-030; it does not affect this issue's mid-read scenario.)
+- **New Issues**: ISSUE-030 (shared finding with ISSUE-025 validation: `on_close` saves unconditionally even when idle/completed)
+
+---
+
+## ISSUE-021 — Failed `PDFReader.open()` leaves the reader pointing at a closed document
+
+**Status**: VALIDATED ✅
+**Severity**: MEDIUM
+
+### Discovery
+- **File**: `src/pdf_reader.py` — `open()` (~lines 13-35: old doc closed before `fitz.open(path)` is attempted)
+- **Description**: `open()` closes the currently open document first, then assigns `self._doc = fitz.open(path)`. If `fitz.open` raises (missing/corrupt/non-PDF file), the exception propagates to `_open_pdf` (which shows an error dialog) but `self._doc` still references the **closed** previous document and `self._path` still names the previous file. `is_open` then returns True and the Play button stays enabled, while `page_count` (`len(self._doc)`) raises `ValueError: document closed` from PyMuPDF on the next page navigation, `_read_next_sentence` page query, or `_update_nav_buttons` — an uncaught exception in a GUI callback.
+- **Root Cause**: Destructive teardown of the old state happens before the fallible operation; no rollback or `self._doc = None` on the failure path. (Note the encrypted-PDF branch from ISSUE-015 handles this correctly by nulling `self._doc`.)
+- **Reproduction**: Open a valid PDF, then Open PDF again and select a corrupt or non-PDF file (error dialog appears), then click ▶ next page or Play — `ValueError: document closed` raised into the Tk callback.
+- **Impact**: App left in a half-broken state after one failed open: stale title, enabled controls, exceptions on navigation. Requires opening another valid PDF or restarting to recover.
+- **Depends On**: None
+- **Fix Suggestion**: Open into a local first and swap on success: `new_doc = fitz.open(path)` → (encryption check) → `if self._doc: self._doc.close()` → `self._doc = new_doc; self._path = path`. At minimum set `self._doc = None` immediately after closing the old doc.
+- **Logging Added**: Added DEBUG in `open()` noting the previous document is closed before the new open is attempted, making the failure ordering visible in logs.
+- **Date Found**: 2026-06-11
+
+### Fix
+- **Date**: 2026-06-11
+- **Changes**: `PDFReader.open()` in `src/pdf_reader.py` now opens into a local first (`new_doc = fitz.open(path)`), runs the ISSUE-015 encryption check against `new_doc`, and only closes/replaces the previous document on success. A failed open (missing/corrupt/non-PDF) or an encrypted PDF now raises while leaving the previously open document — and `is_open`, `page_count`, `_path` — fully usable, so navigation and Play keep working after the error dialog. Behavior note: the encrypted case previously nulled `self._doc`; it now also preserves the prior document, which is strictly better for the app flow. The obsolete close-before-open diagnostic DEBUG was replaced by a close-on-success DEBUG. Tests: `TestIssue021FailedOpenPreservesOldDoc` (2 behavioral tests).
+
+### Validation
+- **Date**: 2026-06-12
+- **Method**: Tests + code inspection
+- **Tests**: `tests/test_issue_validations.py::TestIssue021FailedOpenPreservesOldDoc` — 2 tests; regression guard via `TestIssue015PDFEncryptionAndPageErrors` (4 tests)
+- **Results**: 6 passed, 0 failed
+  - ✅ test_failed_open_preserves_previous_doc (behavioral: `fitz.open` raising leaves `_doc`, `is_open`, `page_count`, `_path` intact)
+  - ✅ test_encrypted_open_preserves_previous_doc (behavioral: encrypted new doc closed, old doc untouched)
+  - ✅ all 4 ISSUE-015 tests still pass (encrypted-on-fresh-reader still leaves `_doc` None and raises ValueError)
+- **Inspection**: `PDFReader.open()` (pdf_reader.py:13-34) now performs the fallible `fitz.open(path)` into `new_doc` first; the ISSUE-015 encryption check closes `new_doc` (not the current doc) and raises; only on full success is the old doc closed and `_doc`/`_path` swapped. There is no failure path that mutates `_doc` or `_path`, so the "closed document with `is_open == True`" state is unreachable. The encrypted-case behavior change (previous doc preserved instead of nulled) is strictly better for the app flow and does not break the ISSUE-015 contract.
+- **Verdict**: Fix is correct and complete. Navigation and Play remain functional after a failed or encrypted open.
+- **New Issues**: None
+
+---
+
+## ISSUE-022 — Stop racing sentence-completion can freeze the GUI for the full 2s monitor-join timeout
+
+**Status**: VALIDATED ✅
+**Severity**: MEDIUM
+
+### Discovery
+- **File**: `src/audio_player.py` — `stop()` monitor join (~lines 171-190), `_monitor` on_done firing (~lines 140-148); `src/app.py` — `_on_sentence_done` `event_generate` call (~line 410)
+- **Description**: Tkinter marshals calls made from non-main threads through the Tcl event loop: the calling thread blocks until the GUI thread's mainloop dispatches the request. The monitor thread's final act is `self._on_done()` → (via `_done_and_cleanup`) → `app._on_sentence_done` → `self.event_generate(...)`. If the user presses Stop (or Open PDF / page nav, which call `_stop()`) in the window after the monitor has passed its `fire` check but before `event_generate` completes, the GUI thread enters `AudioPlayer.stop()` → `self._monitor_thread.join(timeout=2.0)` while the monitor thread is blocked in `event_generate` waiting for that very GUI thread to return to the mainloop. Neither can proceed; the join times out after 2 seconds, the GUI unfreezes, processes the marshalled event (harmless — `_on_sentence_done_event` re-checks `_reading`), and the monitor exits. Net effect: a 2-second hard UI freeze whenever Stop coincides with a sentence boundary — which is exactly when users press Stop.
+- **Root Cause**: A blocking cross-thread Tk marshal (`event_generate` from the monitor thread) combined with the GUI thread blocking on `join()` of that same thread — a lock-step dependency cycle broken only by the join timeout.
+- **Reproduction**: Online voice, short sentences; press Stop repeatedly right as sentences end. Observe ~2s freezes and the "Monitor thread did not exit within 2s join timeout" warning in the log.
+- **Impact**: Periodic 2-second GUI freezes on Stop/page-nav/open; also leaves a monitor thread transiently alive past `stop()`, widening other races (see ISSUE-017).
+- **Depends On**: None
+- **Fix Suggestion**: Do not block the GUI thread on the monitor: (a) drop the join entirely in `stop()` — once `_stop_event` is set and the alias closed, a lingering monitor is harmless; or (b) join with a much shorter timeout (e.g. 0.2s); or (c) make sentence-done dispatch non-blocking — push a token onto a `queue.Queue` from the monitor and poll it on the GUI thread with a recurring `after()` instead of calling `event_generate` from a background thread.
+- **Logging Added**: `stop()` now times the join and logs a WARNING with elapsed time both when the join times out and when it blocked the caller > 0.2s, tagged ISSUE-022.
+- **Date Found**: 2026-06-11
+
+### Fix
+- **Date**: 2026-06-11
+- **Changes**: In `src/audio_player.py`, the monitor thread no longer fires `on_done` inline. It captures the callback (`cb = self._on_done if not self._stop_event.is_set() else None`) and fires it on a detached daemon "on-done-dispatch" thread, then exits immediately. The blocking `event_generate` marshal therefore happens on a thread nobody joins: `stop()`'s `join(timeout=2.0)` returns promptly, breaking the GUI↔monitor lock-step cycle without dropping the join (which still guards against monitor resurrection on the player's shared `_stop_event` across `play()` calls). The ISSUE-003 `event_generate` approach is unchanged — only the calling thread differs, and `_on_sentence_done_event` re-checks `_reading` on the GUI thread as before. Obsolete join-timing diagnostics removed; the plain 2s-timeout WARNING retained. Tests: `TestIssue022NonBlockingOnDoneDispatch` (2 tests).
+
+### Validation
+- **Date**: 2026-06-12
+- **Method**: Tests + code inspection
+- **Tests**: `tests/test_issue_validations.py::TestIssue022NonBlockingOnDoneDispatch` — 3 tests (1 behavioral test added by validator on 2026-06-12)
+- **Results**: 3 passed, 0 failed
+  - ✅ test_on_done_fired_from_dispatcher_thread
+  - ✅ test_monitor_does_not_call_on_done_inline
+  - ✅ test_monitor_exits_and_stop_returns_while_on_done_blocked (new, behavioral: with `on_done` deliberately blocked, the monitor thread exits and `stop()` returns in < 1.5s — the lock-step cycle is broken)
+- **Inspection**: The monitor (audio_player.py:154-169) captures `cb` under the `_stop_event` check and fires it on a detached daemon "on-done-dispatch" thread, then exits; `stop()`'s `join(timeout=2.0)` therefore returns promptly. Regression checks requested: ISSUE-001 self-join guard intact (lines 193-203) and still correct — if the `on_done` chain ever calls `stop()`, it now runs on the dispatch thread, where joining the monitor is legal; ISSUE-003 unchanged — `event_generate` is still the marshalling call, merely invoked from the dispatch thread (equally a non-GUI thread), and `_on_sentence_done_event` re-checks `_reading` on the GUI thread, which also covers a dispatch that fires after `stop()` completed. The unjoined dispatch thread introduces no new shared-state race: it only reads the already-captured `cb`.
+- **Verdict**: Fix is correct and complete — verified behaviorally that the 2s freeze cannot occur. The retained join still depends on a timeout to guard monitor resurrection across `play()` calls; that residual shared-event pattern is filed separately.
+- **New Issues**: ISSUE-028 (player-level `_stop_event` set-then-clear; resurrection possible only if the 2s join times out)
+
+---
+
+## ISSUE-023 — edge-tts synthesis has no timeout: a network stall silently hangs playback forever
+
+**Status**: VALIDATED ✅
+**Severity**: MEDIUM
+
+### Discovery
+- **File**: `src/tts_engine.py` — `_edge_synthesize` (~lines 155-159), `_speak_online._run` (`asyncio.run(...)` call)
+- **Description**: `communicate.save(out_path)` performs network I/O against the Microsoft TTS endpoint with no `asyncio.wait_for` or other timeout. If the connection stalls (Wi-Fi drop mid-request, proxy black-hole — distinct from a clean failure, which raises and is handled), the synth daemon thread blocks indefinitely inside `asyncio.run`. `on_done` is never called, so the sentence pump stops: the UI stays in the "playing" state (Play disabled, Pause enabled) with no audio and no error. The user's only recourse is Stop — and the hung thread still never exits, leaking it (a subsequent Play works only because of the ISSUE-017 shared-event semantics, which is itself a bug).
+- **Root Cause**: Unbounded network operation on the critical sentence-advance path; the chain's liveness depends on `on_done` always eventually firing.
+- **Reproduction**: Start playback with an online voice, then drop network connectivity at the TCP level mid-sentence (e.g., disable the adapter after the connection is established). The next sentence never starts and no error is shown.
+- **Impact**: Reading silently stalls; stuck UI state; leaked synth thread per occurrence.
+- **Depends On**: None
+- **Fix Suggestion**: Wrap the save in a timeout: `await asyncio.wait_for(communicate.save(out_path), timeout=30)` inside `_edge_synthesize`; the existing `except Exception` in `_run` already logs, deletes the tmp file, and fires `on_done`, so a `TimeoutError` would be recovered automatically. Optionally surface a status message ("Network timeout, skipping sentence") via the existing event mechanism.
+- **Logging Added**: None added — the existing "edge-tts synth start" / "synth done" DEBUG pair already identifies a stall (a start with no matching done is the signature).
+- **Date Found**: 2026-06-11
+
+### Fix
+- **Date**: 2026-06-11
+- **Changes**: `_edge_synthesize` in `src/tts_engine.py` now wraps the network call in `await asyncio.wait_for(communicate.save(out_path), timeout=30)`. A TCP-level stall raises `TimeoutError` into `_speak_online._run`'s existing except block, which logs the exception, deletes the tmp file, and fires `on_done` (generation-gated per ISSUE-017) so the sentence pump recovers automatically instead of hanging the UI in the "playing" state forever; the synth thread also exits instead of leaking. The optional "Network timeout" status message was not added (no status-marshalling path from the synth thread exists; the log line suffices). Tests: `TestIssue023SynthTimeout` (1 test).
+
+### Validation
+- **Date**: 2026-06-12
+- **Method**: Tests + code inspection
+- **Tests**: `tests/test_issue_validations.py::TestIssue023SynthTimeout` — 1 test
+- **Results**: 1 passed, 0 failed
+  - ✅ test_edge_synthesize_uses_wait_for
+- **Inspection**: `_edge_synthesize` (tts_engine.py:172) wraps the network call: `await asyncio.wait_for(communicate.save(out_path), timeout=30)`. On Python 3.11+ (this project runs 3.14) `asyncio.TimeoutError` IS the builtin `TimeoutError`, an `Exception` subclass, so it propagates out of `asyncio.run` into `_run`'s `except Exception` block, which logs via `log.exception`, deletes the tmp file, and fires the generation-gated `on_done` — the sentence pump recovers and the synth thread exits instead of leaking. 30s is a reasonable bound for a sentence-length synthesis. No behavioral test was added: the timeout is hardcoded, so exercising it would stall the suite 30s, and patching `wait_for` would test the mock, not the code; the source-level assertion plus the recovery path's existing behavioral coverage (TestIssue017 stale/failure gating) is adequate.
+- **Verdict**: Fix is correct and complete. A TCP-level stall now self-recovers after 30s instead of permanently wedging the "playing" UI state.
+- **New Issues**: None
+
+---
+
+## ISSUE-024 — Bookmark load/restore lacks type and range validation (negative index passes the clamp; non-dict JSON; OSError uncaught)
+
+**Status**: VALIDATED ✅
+**Severity**: LOW
+
+### Discovery
+- **File**: `src/app.py` — `_load_bookmarks` (~lines 487-499), `_restore_bookmark` (~lines 518-560: `bm.get("page", 0)`, `bm.get("sentence_idx", 0)`, ISSUE-009 clamp)
+- **Description**: Three gaps in bookmark robustness. (1) `_load_bookmarks` catches only `FileNotFoundError`/`JSONDecodeError`; `PermissionError`/other `OSError` and `UnicodeDecodeError` propagate uncaught into `_open_pdf`/`_save_bookmark`. A valid-JSON file whose root is not a dict (e.g. a list) is returned as-is and breaks `bookmarks.get(path)` / key assignment. (2) The ISSUE-009 clamp in `_restore_bookmark` only bounds the **upper** end (`if sentence_idx > max_idx`); a negative `sentence_idx` from a hand-edited/corrupted file passes through, and `_read_next_sentence` then indexes `self._sentences[-n]` — Python negative indexing reads sentences from the *end* of the page, after which the index increments through −2, −1, 0… re-reading the page start. (3) Non-int values (e.g. `"page": "3"`) raise `TypeError` on `page >= self._pdf.page_count` inside a GUI callback.
+- **Root Cause**: Persisted external data treated as trusted; validation added by ISSUE-009 covered only the one observed failure mode.
+- **Reproduction**: Edit `~/.documentreader_bookmarks.json` to set `"sentence_idx": -3` (or root `[]`, or a string page) and open the bookmarked PDF.
+- **Impact**: Bizarre read order (end-of-page sentences first) or uncaught exceptions on open. Requires a corrupted/edited file, hence LOW.
+- **Depends On**: None
+- **Fix Suggestion**: In `_load_bookmarks`, broaden the except to `(OSError, json.JSONDecodeError, UnicodeDecodeError)` and return `{}` unless `isinstance(data, dict)`. In `_restore_bookmark`, coerce/validate: `if not isinstance(page, int) or not isinstance(sentence_idx, int): return False`, and clamp both ends: `sentence_idx = max(0, min(sentence_idx, max_idx))`, `page = max(0, page)`.
+- **Logging Added**: `_load_bookmarks` now logs a WARNING when the JSON root is not a dict (behavior unchanged).
+- **Date Found**: 2026-06-11
+
+### Fix
+- **Date**: 2026-06-11
+- **Changes**: In `src/app.py`: (1) `_load_bookmarks` broadened its except to `(OSError, json.JSONDecodeError, UnicodeDecodeError)` and now returns `{}` for a non-dict JSON root (the diagnostic WARNING is kept, but the bad data is no longer returned to callers). (2) `_restore_bookmark` requires the entry to be a dict, requires `page`/`sentence_idx` to be ints (WARNING + ignore otherwise, so a string page can no longer raise `TypeError` in a GUI callback), clamps `page = max(0, page)`, and clamps `sentence_idx` at both ends via `max(0, min(sentence_idx, max_idx))` so negative indices can no longer read sentences from the end of the page. Side benefit: the both-ends clamp also satisfies the previously false-failing ISSUE-009 validation test that expected a `min(` pattern. Tests: `TestIssue024BookmarkValidation` (5 tests, includes behavioral non-dict-root and PermissionError cases).
+
+### Validation
+- **Date**: 2026-06-12
+- **Method**: Tests + code inspection
+- **Tests**: `tests/test_issue_validations.py::TestIssue024BookmarkValidation` — 7 tests (2 behavioral tests added by validator on 2026-06-12)
+- **Results**: 7 passed, 0 failed
+  - ✅ test_load_bookmarks_non_dict_root_returns_empty (behavioral)
+  - ✅ test_load_bookmarks_handles_oserror (behavioral, PermissionError)
+  - ✅ test_restore_validates_int_types
+  - ✅ test_restore_clamps_both_ends
+  - ✅ test_restore_requires_dict_entry
+  - ✅ test_restore_clamps_negative_sentence_idx_behaviorally (new: `sentence_idx=-3` restores as 0, not end-of-page)
+  - ✅ test_restore_ignores_string_page_behaviorally (new: `"page": "3"` rejected with no TypeError)
+- **Inspection**: All three discovery gaps closed. (1) `_load_bookmarks` (app.py:490-504) catches `(OSError, json.JSONDecodeError, UnicodeDecodeError)` — `PermissionError` ⊂ `OSError` — and returns `{}` for a non-dict root with a WARNING. (2) `_restore_bookmark` clamps `sentence_idx` at both ends via `max(0, min(sentence_idx, max_idx))` (line 584), eliminating the negative-index end-of-page read; the clamp also fixed the previously false-failing ISSUE-009 `min(` test (confirmed passing). (3) Entries must be dicts and `page`/`sentence_idx` must be ints (WARNING + ignore), and `page = max(0, page)` guards the lower bound. Minor non-defect note: `isinstance(True, int)` is True, so a boolean value would pass the type check — it clamps to 0/1 and is harmless.
+- **Verdict**: Fix is correct and complete; both new behavioral tests confirm the previously-failing inputs are now handled safely.
+- **New Issues**: None
+
+---
+
+## ISSUE-026 — `_mci()` blocks its caller forever if the MCI dispatcher thread dies (no worker exception guard, no result timeout)
+
+**Status**: VALIDATED ✅
+**Severity**: LOW
+
+### Discovery
+- **File**: `src/audio_player.py` — `_mci_worker` (~lines 26-50), `_mci`/`_mci_query` (`rq.get()` with no timeout, ~lines 53-64)
+- **Description**: Every MCI command round-trips through the single module-level dispatcher thread, and the caller blocks on `rq.get()` with no timeout. The dispatcher loop has no per-command exception handling: any unexpected exception (ctypes argument conversion error, `create_unicode_buffer` failure under memory pressure, etc.) kills the thread permanently. From then on every `_mci()`/`_mci_query()` call — including those made by the GUI thread in `stop()`, `pause()`, `resume()` — blocks forever, freezing the app with no diagnostic and no recovery. The monitor thread also wedges in its `status` queries. The failure is speculative in normal operation (mciSendStringW itself reports errors via return code, not exceptions), but the design has a single point of failure with an unbounded wait on the GUI thread.
+- **Root Cause**: Unbounded `Queue.get()` on the caller side coupled with an unguarded worker loop — liveness of every caller depends on the worker never raising.
+- **Reproduction**: Inject a fault: put a malformed item (e.g. a non-tuple) on `_cmd_queue` or raise inside the loop; next Play/Stop hangs the GUI permanently.
+- **Impact**: Worst-case permanent GUI freeze; currently low probability, hence LOW severity — but unbounded waits on the GUI thread are never acceptable.
+- **Depends On**: None
+- **Fix Suggestion**: (a) Wrap the per-command body in `try/except Exception`, log, and always `result_q.put((-1, ""))` so callers are never orphaned; (b) use `rq.get(timeout=5.0)` in `_mci`/`_mci_query` and return an error code/empty string on `queue.Empty` with an ERROR log; (c) optionally restart the worker thread on death.
+- **Logging Added**: Wrapped the worker loop in `try/except BaseException` that calls `log.exception` (then re-raises, preserving behavior) so a dispatcher death is at least visible in the log instead of manifesting only as a silent freeze.
+- **Date Found**: 2026-06-11
+
+### Fix
+- **Date**: 2026-06-11
+- **Changes**: In `src/audio_player.py`: (a) `_mci_worker` now guards each command individually — a malformed queue item is logged and skipped, and any exception while executing a command is logged via `log.exception` with `result_q.put((-1, ""))` still answering the caller, so the dispatcher can neither die nor orphan a waiting caller. (b) `_mci` and `_mci_query` use `rq.get(timeout=5.0)` and on `queue.Empty` log an ERROR and return `-1` / `""`, so the GUI thread can never block indefinitely even if the dispatcher were somehow wedged. The whole-loop `BaseException` diagnostic wrapper (which re-raised and let the thread die) was removed as obsolete. Worker restart (option c) was not implemented — with (a) the worker can no longer exit except via the explicit `None` sentinel. Tests: `TestIssue026MciDispatcherHardening` (3 tests, includes a behavioral malformed-item survival test against the live dispatcher).
+
+### Validation
+- **Date**: 2026-06-12
+- **Method**: Tests + code inspection
+- **Tests**: `tests/test_issue_validations.py::TestIssue026MciDispatcherHardening` — 3 tests
+- **Results**: 3 passed, 0 failed
+  - ✅ test_worker_guards_each_command
+  - ✅ test_callers_use_timeout
+  - ✅ test_worker_survives_malformed_item (behavioral: live dispatcher answers a real command after swallowing a non-unpackable item)
+- **Inspection**: Both suggested mitigations are implemented (audio_player.py:26-76): (a) the worker guards the unpack (log + continue) and the command execution (log.exception + `result_q.put((-1, ""))`), so callers are answered even on ctypes failures; (b) `_mci`/`_mci_query` use `rq.get(timeout=5.0)` and return `-1`/`""` with an ERROR log on `queue.Empty`, so the GUI thread can never block indefinitely — the issue's headline symptom (permanent GUI freeze) is structurally eliminated regardless of worker state. One residual found: the fix's claim that the dispatcher "can neither die nor orphan a caller" is slightly overstated — a malformed item that unpacks into two elements but whose second element is not a Queue makes the except-handler's own `result_q.put((-1, ""))` raise, killing the worker (see ISSUE-029). The caller timeouts bound that hypothetical to degraded 5s error returns, not a freeze, so it does not negate this fix.
+- **Verdict**: Fix is correct and complete for the defect as filed (unbounded waits and unguarded command execution). The remaining recovery-path gap is filed separately as LOW.
+- **New Issues**: ISSUE-029 (`result_q.put` in the except handler is itself unguarded)
 
 ---
 
