@@ -311,6 +311,16 @@ class DocumentReaderApp(ctk.CTk):
             if not self._tts.is_playing:
                 self._reading = True
                 self._read_next_sentence()
+            else:
+                # ISSUE-031 fix: the player actually resumed the paused MCI
+                # track, so the interrupted sentence will finish from where it
+                # left off.  The ISSUE-007 rewind in _pause has already served
+                # its purpose (the pause-time bookmark write); re-advance the
+                # index past the resumed sentence so the track's natural
+                # on_done continues with the NEXT sentence instead of
+                # re-reading the one the user just heard finish.
+                if self._sentence_idx < len(self._sentences):
+                    self._sentence_idx += 1
             return
 
         if not self._sentences:

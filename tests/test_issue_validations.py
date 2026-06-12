@@ -1805,5 +1805,133 @@ class TestIssue030CloseBookmarkGate(unittest.TestCase):
             os.remove(path)
 
 
+# ---------------------------------------------------------------------------
+# ISSUE-031 — online mid-audio pause/resume must not re-read the sentence
+# ---------------------------------------------------------------------------
+
+class TestIssue031OnlineResumeReadvance(unittest.TestCase):
+
+    def _make_app(self, sentence_idx, sentences=None, playing_after_resume=True):
+        """App as left by _pause during online mid-audio playback: _reading
+        stays True, _paused True, _sentence_idx already rewound by ISSUE-007."""
+        import src.app as app_mod
+        app = app_mod.DocumentReaderApp.__new__(app_mod.DocumentReaderApp)
+        app._pdf = MagicMock()                  # is_open truthy
+        app._sentences = sentences if sentences is not None else ["s0", "s1", "s2"]
+        app._sentence_idx = sentence_idx
+        app._reading = True
+        app._paused = True
+        app._tts = MagicMock()
+        app._tts.is_playing = playing_after_resume
+        app._play_btn = MagicMock()
+        app._pause_btn = MagicMock()
+        app._stop_btn = MagicMock()
+        app._save_bookmark = MagicMock()
+        app._highlight_sentence = MagicMock()
+        app._clear_highlight = MagicMock()
+        app._pending_after_id = None
+        return app
+
+    def test_play_source_readvances_index_on_resume(self):
+        import src.app as app_mod
+        src = inspect.getsource(app_mod.DocumentReaderApp._play)
+        self.assertIn("_sentence_idx += 1", src,
+                      "_play does not re-advance _sentence_idx after an online "
+                      "MCI resume (ISSUE-031 fix missing)")
+
+    def test_online_resume_readvances_past_interrupted_sentence(self):
+        """When the MCI track actually resumes, the rewound index must be
+        re-advanced so the track's natural on_done continues with the NEXT
+        sentence, not the one whose audio is finishing."""
+        # Was speaking "s1" (idx post-incremented to 2); _pause rewound to 1.
+        app = self._make_app(sentence_idx=1, playing_after_resume=True)
+        app._read_next_sentence = MagicMock()
+        app._play()
+        self.assertEqual(app._sentence_idx, 2,
+                         "online resume must re-advance the index past the "
+                         "resumed sentence (ISSUE-031)")
+        self.assertFalse(app._paused)
+        app._read_next_sentence.assert_not_called()  # natural on_done drives the pump
+
+    def test_online_resume_next_on_done_reads_following_sentence(self):
+        """Headline repro: after resume, the resumed track's on_done must speak
+        the sentence AFTER the interrupted one — not re-read it."""
+        app = self._make_app(sentence_idx=1, playing_after_resume=True)
+        app._voice_var = MagicMock()
+        app._voice_var.get.return_value = "Some Voice"
+        app._voices = MagicMock()
+        app._speed_var = MagicMock()
+        app._speed_var.get.return_value = 1.0
+        app._play()
+        # Simulate the resumed track finishing: natural on_done -> GUI event.
+        app._on_sentence_done_event()
+        app._tts.speak.assert_called_once()
+        spoken = app._tts.speak.call_args[0][0]
+        self.assertEqual(spoken, "s2",
+                         "resumed track's on_done re-read the interrupted "
+                         "sentence instead of advancing (ISSUE-031)")
+
+    def test_offline_resume_still_rereads_interrupted_sentence(self):
+        """Offline (is_playing False after resume): pyttsx3 cannot resume
+        mid-sentence, so the rewound index must be kept and the interrupted
+        sentence re-read via _read_next_sentence (ISSUE-006)."""
+        app = self._make_app(sentence_idx=1, playing_after_resume=False)
+        app._read_next_sentence = MagicMock()
+        app._play()
+        self.assertEqual(app._sentence_idx, 1,
+                         "offline resume must keep the rewound index so the "
+                         "interrupted sentence is re-read (ISSUE-006)")
+        self.assertTrue(app._reading)
+        app._read_next_sentence.assert_called_once()
+
+    def test_online_resume_clamps_index_at_page_end(self):
+        """Defensive clamp: an index already at len(sentences) must not be
+        advanced past it."""
+        app = self._make_app(sentence_idx=3, playing_after_resume=True)
+        app._read_next_sentence = MagicMock()
+        app._play()
+        self.assertEqual(app._sentence_idx, 3,
+                         "online resume advanced the index past len(sentences)")
+
+    def test_online_resume_of_last_sentence_ends_page_naturally(self):
+        """Interrupted LAST sentence: resume re-advances to len(sentences) so
+        the natural on_done triggers page-done instead of re-reading."""
+        app = self._make_app(sentence_idx=2, playing_after_resume=True)
+        app._play()
+        self.assertEqual(app._sentence_idx, 3)
+
+    def test_pause_stop_play_starts_at_interrupted_sentence(self):
+        """Bookmark semantics unchanged: pause saves the rewound index, and a
+        subsequent Stop re-saves the same index (no double rewind)."""
+        app = self._make_app(sentence_idx=2, playing_after_resume=True)
+        app._paused = False  # actively reading "s1" (idx post-incremented to 2)
+        saved = []
+        app._save_bookmark = MagicMock(
+            side_effect=lambda *a, **k: saved.append(app._sentence_idx))
+        app._pause()
+        self.assertEqual(saved, [1],
+                         "_pause must bookmark the interrupted sentence (ISSUE-007)")
+        app._stop()
+        self.assertEqual(saved, [1, 1],
+                         "Stop while paused must re-save the rewound index "
+                         "without rewinding again")
+        self.assertEqual(app._sentence_idx, 0)
+
+    def test_double_pause_resume_cycle_stays_consistent(self):
+        """pause -> resume -> pause -> resume must keep pointing at the same
+        in-flight sentence (no drift in either direction)."""
+        app = self._make_app(sentence_idx=2, playing_after_resume=True)
+        app._paused = False  # actively reading "s1"
+        app._pause()
+        self.assertEqual(app._sentence_idx, 1)
+        app._play()   # online resume: re-advance
+        self.assertEqual(app._sentence_idx, 2)
+        app._pause()
+        self.assertEqual(app._sentence_idx, 1)
+        app._play()
+        self.assertEqual(app._sentence_idx, 2,
+                         "index drifted across repeated pause/resume cycles")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

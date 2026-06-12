@@ -6,24 +6,6 @@ Issues are sorted by status: OPEN → NEEDS_REVIEW → FIXED → PARTIAL → VAL
 
 ---
 
-## ISSUE-031 — Online pause→resume re-reads the interrupted sentence in full after its resumed audio completes
-
-**Status**: OPEN
-**Severity**: MEDIUM
-
-### Discovery
-- **File**: `src/app.py` — `_pause()` (~line 335: ISSUE-007 rewind), `_play()` resume branch (~lines 298-314: no index re-advance when the player actually resumes)
-- **Description**: `_pause()` rewinds `_sentence_idx` by one (ISSUE-007) so the bookmark and the offline/mid-synth resume paths point at the interrupted sentence. For an ONLINE voice paused while its audio is actually playing, however, Resume continues the same MCI track (`_tts.resume()` → `_player.resume()`), and `_play` returns without touching the index because `is_playing` is True. When the resumed track finishes, its natural `on_done` (deliberately not generation-gated — see ISSUE-027's fix rationale) re-enters `_read_next_sentence` at the rewound index: the sentence whose audio just completed is synthesized and read again in full. The user hears: first part of sentence N → pause → rest of sentence N → all of sentence N again → N+1. This occurs on every online mid-audio pause/resume — the most common pause scenario.
-- **Root Cause**: The ISSUE-007 rewind assumes the interrupted sentence will be re-spoken from the start on resume (true for bookmarks, offline voices, and pause-during-synthesis); the online mid-audio path instead resumes the original audio, making the rewound index stale once that audio completes.
-- **Impact**: One fully duplicated sentence per online pause/resume. No crash, no data loss; audible and confusing.
-- **Reproduction**: Online voice, Play, Pause while a sentence is audibly playing, Resume, let the sentence finish — it is read again from the beginning.
-- **Depends On**: ISSUE-007 (the rewind), ISSUE-019 (pause generation bump), ISSUE-027 (documents why the natural on_done must fire on this path)
-- **Fix Suggestion**: In `_play`'s resume branch, when the player actually resumed (`self._tts.is_playing` is True after `resume()`), re-advance the index past the resumed sentence: `if self._sentence_idx < len(self._sentences): self._sentence_idx += 1` — the rewound value has already served its purpose (the pause-time bookmark write). Alternatively stop mutating `_sentence_idx` in `_pause` and pass the rewound value only to that `_save_bookmark` call, leaving the live index alone (note ISSUE-020's fix text explains why the rewind must not move *into* `_save_bookmark` — `_stop`/`on_close` rewind at the call site).
-- **Logging Added**: None (the existing "Resuming playback at sentence_idx=%d" INFO plus the per-sentence DEBUG in `_read_next_sentence` already show the same index spoken twice).
-- **Date Found**: 2026-06-12 (by issue-solution-validator while tracing the pause→resume path during ISSUE-027 validation)
-
----
-
 ## ISSUE-016 — Speed/voice changes mid-playback not reflected until next sentence
 
 **Status**: NEEDS_REVIEW
@@ -1079,6 +1061,45 @@ Issues are sorted by status: OPEN → NEEDS_REVIEW → FIXED → PARTIAL → VAL
   - ✅ all 6 ISSUE-030 tests pass (the gate that closes this issue's remaining path)
 - **Inspection**: The previous PARTIAL verdict's sole remaining gap — `on_close` unconditionally re-saving `{page: last, sentence_idx: 0}` after completion — is closed by the ISSUE-030 gate (app.py:603): `_stop(completed=True)` leaves `_reading` and `_paused` both False, so the close path saves nothing and the entry deleted by `_clear_bookmark()` stays deleted. The in-session mechanics confirmed in the first validation are unchanged (`_stop(completed=True)` skips the rewind-and-save; document end clears the bookmark; page end without auto-advance bookmarks the next page's start). The issue's own reproduction — read to the end, close, reopen — now passes for both single-page and multi-page documents.
 - **Verdict**: Fully resolved. The stale resume prompt and the redundant last-sentence re-read are gone for every document shape, including the close-after-completion path that previously failed.
+- **New Issues**: None
+
+---
+
+## ISSUE-031 — Online pause→resume re-reads the interrupted sentence in full after its resumed audio completes
+
+**Status**: VALIDATED ✅
+**Severity**: MEDIUM
+
+### Discovery
+- **File**: `src/app.py` — `_pause()` (~line 335: ISSUE-007 rewind), `_play()` resume branch (~lines 298-314: no index re-advance when the player actually resumes)
+- **Description**: `_pause()` rewinds `_sentence_idx` by one (ISSUE-007) so the bookmark and the offline/mid-synth resume paths point at the interrupted sentence. For an ONLINE voice paused while its audio is actually playing, however, Resume continues the same MCI track (`_tts.resume()` → `_player.resume()`), and `_play` returns without touching the index because `is_playing` is True. When the resumed track finishes, its natural `on_done` (deliberately not generation-gated — see ISSUE-027's fix rationale) re-enters `_read_next_sentence` at the rewound index: the sentence whose audio just completed is synthesized and read again in full. The user hears: first part of sentence N → pause → rest of sentence N → all of sentence N again → N+1. This occurs on every online mid-audio pause/resume — the most common pause scenario.
+- **Root Cause**: The ISSUE-007 rewind assumes the interrupted sentence will be re-spoken from the start on resume (true for bookmarks, offline voices, and pause-during-synthesis); the online mid-audio path instead resumes the original audio, making the rewound index stale once that audio completes.
+- **Impact**: One fully duplicated sentence per online pause/resume. No crash, no data loss; audible and confusing.
+- **Reproduction**: Online voice, Play, Pause while a sentence is audibly playing, Resume, let the sentence finish — it is read again from the beginning.
+- **Depends On**: ISSUE-007 (the rewind), ISSUE-019 (pause generation bump), ISSUE-027 (documents why the natural on_done must fire on this path)
+- **Fix Suggestion**: In `_play`'s resume branch, when the player actually resumed (`self._tts.is_playing` is True after `resume()`), re-advance the index past the resumed sentence: `if self._sentence_idx < len(self._sentences): self._sentence_idx += 1` — the rewound value has already served its purpose (the pause-time bookmark write). Alternatively stop mutating `_sentence_idx` in `_pause` and pass the rewound value only to that `_save_bookmark` call, leaving the live index alone (note ISSUE-020's fix text explains why the rewind must not move *into* `_save_bookmark` — `_stop`/`on_close` rewind at the call site).
+- **Logging Added**: None (the existing "Resuming playback at sentence_idx=%d" INFO plus the per-sentence DEBUG in `_read_next_sentence` already show the same index spoken twice).
+- **Date Found**: 2026-06-12 (by issue-solution-validator while tracing the pause→resume path during ISSUE-027 validation)
+
+### Fix
+- **Date**: 2026-06-12
+- **Changes**: Implemented the primary Fix Suggestion: in `_play()`'s resume branch, when the player actually resumed the paused MCI track (`self._tts.is_playing` is True after `resume()`), re-advance the index past the resumed sentence — `if self._sentence_idx < len(self._sentences): self._sentence_idx += 1` — so the track's natural `on_done` continues with the NEXT sentence instead of re-reading the one whose audio just completed. The rewound value has already served its purpose (the pause-time `_save_bookmark` write). The offline branch (`is_playing` False) is unchanged: the rewound index is kept and `_read_next_sentence()` re-reads the interrupted sentence (ISSUE-006 semantics). The clamp at `len(self._sentences)` means an interrupted LAST sentence re-advances to page-end, so its natural `on_done` triggers page-done rather than a re-read. ISSUE-007 bookmark semantics, the pause→stop→play path, and the generation-token design (ISSUE-017/019/027 — no gen re-check in `_done_and_cleanup`) are all preserved. Changed in `src/app.py`; 8 tests added in `tests/test_issue_validations.py::TestIssue031OnlineResumeReadvance` covering the headline repro, offline re-read, page-end clamp, bookmark semantics, and double pause/resume cycles.
+
+### Validation
+- **Date**: 2026-06-12
+- **Method**: Tests + code inspection
+- **Tests**: `tests/test_issue_validations.py::TestIssue031OnlineResumeReadvance` — 8 tests
+- **Results**: 8 passed, 0 failed (full suite: 138 tests, 0 failures, 0 errors)
+  - ✅ test_play_source_readvances_index_on_resume
+  - ✅ test_online_resume_readvances_past_interrupted_sentence
+  - ✅ test_online_resume_next_on_done_reads_following_sentence — headline repro: after resume, the resumed track's natural on_done speaks "s2", not the rewound "s1"
+  - ✅ test_offline_resume_still_rereads_interrupted_sentence — ISSUE-006 branch unregressed
+  - ✅ test_online_resume_clamps_index_at_page_end
+  - ✅ test_online_resume_of_last_sentence_ends_page_naturally
+  - ✅ test_pause_stop_play_starts_at_interrupted_sentence — ISSUE-007 bookmark semantics unregressed
+  - ✅ test_double_pause_resume_cycle_stays_consistent — no index drift across repeated cycles
+- **Inspection**: `git diff` confirms the fix is exactly the 10 lines described, in `_play()`'s resume else-branch only (src/app.py:314-323); no other source file changed. Traced all four interaction paths: (1) ISSUE-019 mid-synthesis pause — `TTSEngine.pause()` bumps the generation under `_gen_lock` before `_speak_online`'s check-and-play block can hand off, so the synth discards and `_player.play()` never runs; `is_playing` is therefore False after `resume()` and the re-advance correctly does NOT fire (the lock permits only two orderings: discard-before-play → offline-style re-read, or bump-after-play → audio was already playing, i.e. the mid-audio case — both handled). (2) ISSUE-027 — `_done_and_cleanup` in tts_engine.py is untouched and still has no generation re-check, with the NOTE comment explicitly documenting that this resume path depends on the gen-stale-but-resumed utterance's natural on_done. (3) Interrupted last sentence — rewound to L-1, re-advanced to L; the natural on_done routes through `_read_next_sentence`'s `idx >= len` branch into `_on_page_done`, where the ISSUE-025/030 bookmark logic (clear on document end, next-page save otherwise, `_stop(completed=True)` skipping the rewind-save) applies correctly since the sentence was fully heard. (4) Page navigation while paused — `_prev_page`/`_next_page` call `_stop()` first, clearing `_paused`, so the re-advance can never fire against a swapped sentence list. The `< len(self._sentences)` clamp is defensive (a rewound index is always < len in reachable states) and correct. `_reading` remains True across pause/resume (only `_stop` clears it), so the on_done chain stays live without the else-branch needing to set it.
+- **Verdict**: Fix is confirmed correct and complete. The online mid-audio pause/resume duplicate read is gone, and the offline, mid-synthesis, bookmark, page-end, and repeated-cycle paths are all preserved.
 - **New Issues**: None
 
 ---
