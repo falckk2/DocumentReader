@@ -17,7 +17,9 @@ metadata:
 
 **Never join a thread that marshals to the GUI:** `event_generate` from a background thread BLOCKS until the GUI mainloop services it. If the GUI thread `join()`s that thread (AudioPlayer.stop joining the monitor), you get a lock-step freeze for the join timeout. Fix (ISSUE-022): fire `on_done` on a detached "on-done-dispatch" daemon thread so the joined thread exits immediately.
 
-**Cancellation via generation token, never set-then-clear a shared Event:** `speak()` doing `stop_event.set()` then `clear()` resurrects in-flight utterances that check the event after the clear (ISSUE-017). The validated pattern: `_generation` int + `_gen_lock` in TTSEngine; `stop()`/`pause()` bump it; each utterance captures `gen` at start and checks `gen == self._generation` before playing (online) / in a gated on_done closure (offline). Closures gate on_done without changing the pyttsx3 queue tuple format (a test asserts on it).
+**Cancellation via generation token, never set-then-clear a shared Event:** `speak()` doing `stop_event.set()` then `clear()` resurrects in-flight utterances that check the event after the clear (ISSUE-017). The validated pattern: `_generation` int + `_gen_lock` in TTSEngine; `stop()`/`pause()` bump it; each utterance captures `gen` at start and checks `gen == self._generation` before playing (online) / in a gated on_done closure (offline). Closures gate on_done without changing the pyttsx3 queue tuple format (a test asserts on it). Same pattern applied per-playback in AudioPlayer (ISSUE-028): each `play()` creates a fresh `threading.Event` and the monitor captures its own event + on_done, never the shared slots.
+
+**Gate generation checks at the HANDOFF, never at COMPLETION:** a suggested fix can be wrong even when written by the validator — ISSUE-027's primary suggestion (re-check `gen == self._generation` inside `_done_and_cleanup` before on_done) would have killed online pause/resume: `pause()` bumps the generation (ISSUE-019), resume continues the MCI audio of that gen-stale utterance, and its natural on_done is what keeps the sentence pump alive. Completion callbacks of gen-stale-but-resumed playbacks MUST fire. The correct closure of the TOCTOU is holding `_gen_lock` across check+`_player.play()`; that in turn required `play()`'s MCI-open-failure on_done to fire on a detached thread (an inline callback would `event_generate` toward a GUI thread blocked on `_gen_lock` in `stop()` — deadlock). Test `test_done_and_cleanup_does_not_recheck_generation` pins this; before changing online completion gating, trace the pause→resume→natural-on_done path.
 
 **pyttsx3 COM threading:** pyttsx3 (SAPI5) engine must live on a single dedicated thread (ISSUE-013). To interrupt mid-`runAndWait`, connect a `started-word` callback that checks a `threading.Event` and calls `engine.stop()` — the callback runs ON the worker thread inside runAndWait, so it is COM-safe (ISSUE-018).
 
@@ -36,7 +38,8 @@ metadata:
 ## Test suite gotchas
 
 - `tests/test_issue_validations.py` uses source-inspection assertions: substrings in comments can trip `assertNotIn` checks (e.g. a comment containing `self.after(` failed a test). Word comments carefully in fixed code.
-- 2 pre-existing test ERRORs (`KeyError: 'src.tts_engine'` in TestIssue002) are a test-infra defect (missing import before `sys.modules[...]` access) owned by the validator — not code defects; do not count them as regressions.
+- The old 2 test ERRORs (`KeyError: 'src.tts_engine'` in TestIssue002) were fixed by the validator on 2026-06-12 (explicit import in setUp); as of the 2026-06-12 batch the suite baseline is fully green (126 tests after ISSUE-027..030).
+- pytest is NOT installed (Python 3.14); run the suite with `python -m unittest tests.test_issue_validations`.
 - `test_queue_command_format` / ISSUE-013 tests pin the pyttsx3 queue tuple `("speak", text, voice_id, rate_wpm, on_done)` — extend behavior via closures over on_done, not by changing the tuple.
 
 ## Known follow-up (not yet filed as an issue)

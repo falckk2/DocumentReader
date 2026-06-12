@@ -25,26 +25,33 @@ Test `test_restore_bookmark_clamps_sentence_idx` checks for `'min('` in source. 
 - When testing "implementation uses function F", prefer checking for behavior/equivalence rather than requiring a specific function name
 - For `sys.modules["module.name"]` access, always ensure the module is explicitly imported in the test or in `setUp()` — alphabetical test ordering can bite you
 - `inspect.getsource()` on a nested function (like `_monitor` inside `play()`) is found by getting source of the enclosing method — works because the monitor is a closure defined inline
+- Lock-serialization tests: to prove "bump cannot land mid-handoff", block inside the handed-off call (fake `play()` waiting on an Event) and assert a concurrent `_bump_generation()` does NOT complete within 0.5s, then release and assert it does. Deterministic, no sleeps-as-synchronization.
+- Stale-monitor tests: stall the monitor inside a fake `_mci_query` keyed on `threading.current_thread()` identity so only the OLD monitor blocks; deliberately let the 2s join time out (costs ~2s per join — budget ~4.5s for the full scenario). The monitor calls module-global `_mci_query` at call time, so reassigning `ap._mci_query` works.
 
 ## Validation Methodology That Works Well
-1. Run `python -m unittest tests/test_issue_validations.py -v 2>&1` for full output
+1. Run `python -m unittest tests.test_issue_validations -v` for full output (pytest NOT installed)
 2. For ERRORs: check if they are test infrastructure bugs (KeyError on sys.modules) vs real failures
 3. For FAILs: check if the assertion is too prescriptive (requires exact implementation choice) vs genuinely wrong behavior
-4. Supplement with direct Python inspection: `python -c "from src.X import Y; import inspect; print(inspect.getsource(Y.method))"` 
+4. Supplement with direct Python inspection: `python -c "from src.X import Y; import inspect; print(inspect.getsource(Y.method))"`
 5. For logic correctness (clamping, arithmetic), write explicit equivalence test cases in the analysis
 
-## Recurring Defect Families (2026-06-12 session)
-- **Set-then-cleared shared Event** = resurrection bug. Fixed in TTSEngine via generation token (ISSUE-017), but the same pattern still lives in `AudioPlayer._stop_event` across `play()` calls (filed as ISSUE-028). When validating any cancellation fix here, grep for `.clear()` on shared events.
-- **Check-then-act residuals**: token/flag checks done outside a lock and not re-checked at the final action (e.g. gen check vs `_player.play()` handoff — ISSUE-027; `_done_and_cleanup` not gen-gated). A token fix can be correct for the filed bug while leaving a microsecond TOCTOU — validate the filed repro, then file the residual as a NEW low-severity issue rather than failing the fix.
-- **`on_close` is the chronic miss site for bookmark semantics**: ISSUE-020 (missed rewind) and ISSUE-030 (unconditional save clobbers Stop-saved position and resurrects completion-cleared bookmarks). Any bookmark-related fix must be checked against the close-the-window path — it undermined the otherwise-correct ISSUE-025 fix (marked PARTIAL because the issue's own repro "finish → close → reopen" still failed for multi-page docs).
-- **Recovery paths need guarding too**: ISSUE-026's `except` handler's own `result_q.put` can raise (ISSUE-029). When a fix adds an error handler, check whether the handler itself can throw.
+## Recurring Defect Families (2026-06-12 sessions)
+- **Set-then-cleared shared Event** = resurrection bug. Eliminated from BOTH TTSEngine (gen token, ISSUE-017) and AudioPlayer (fresh per-playback Event + closure-captured on_done, ISSUE-028). Pattern is now extinct in the codebase; if new playback/cancel code appears, grep for `.clear()` on shared events.
+- **Check-then-act residuals**: closed in `_speak_online` by holding `_gen_lock` across check AND `_player.play()` (ISSUE-027). Key enabler: `play()` must never fire on_done inline (failure path dispatches detached), or holding the lock would deadlock against a GUI-side `stop()`.
+- **The rewound `_sentence_idx` is a trap**: `_pause` rewinds it (ISSUE-007) assuming the sentence will be RE-spoken on resume. True for offline/mid-synth/bookmarks; FALSE for online mid-audio resume (MCI track continues, natural on_done then re-reads the rewound index → full duplicate sentence — ISSUE-031). When validating anything touching pause/resume, write out the index value at each step of the online mid-audio flow.
+- **`on_close` is the chronic miss site for bookmark semantics**: ISSUE-020, ISSUE-030. Now gated on `_reading or _paused`; that gate is correct because `_stop(completed=True)` runs synchronously on the GUI thread before `on_close` can.
+- **Recovery paths need guarding too**: ISSUE-026's `except` handler's own `result_q.put` could raise (fixed in ISSUE-029 with isinstance guard + guarded recovery put). When a fix adds an error handler, check whether the handler itself can throw.
+- **Detached on-done-dispatch threads are not retroactively cancellable**: once the monitor (or play()'s failure path) hands on_done to a dispatch thread, a Stop+Play landing in that sub-ms window could advance the new read. Bounded only by app-level `_reading` re-check. Consciously accepted residual of the ISSUE-022 design — noted in ISSUE-027 validation, NOT filed (no enlargeable window, humanly unreachable). Don't re-file it.
 
 ## Validating Multi-Issue Fix Batches (what worked 2026-06-12)
-- Trace *interactions* between fixes, not just each fix in isolation: pause() bumping the generation (ISSUE-019) could plausibly have broken resume-after-real-pause — it doesn't, because the gen gate applies only at the pre-play handoff; the on_done of an already-playing track is not gated. Writing out the full event sequence for each user flow (pause→resume, stop→play, finish→close→reopen) is what surfaced ISSUE-030.
-- pyttsx3 callbacks (`started-word`) are invoked with **kwargs on the thread running `runAndWait` — an in-worker `engine.stop()` from the callback preserves the single-owner COM constraint (ISSUE-013) by construction.
+- Trace *interactions* between fixes, not just each fix in isolation. Writing out the full event sequence for each user flow (pause→resume, stop→play, finish→close→reopen) is what surfaced ISSUE-030 and ISSUE-031.
+- When a fixer REJECTS part of a fix suggestion with a stated rationale, verify the rationale by tracing the path it claims to protect. The ISSUE-027 rejection (no gen re-check in `_done_and_cleanup`) is correct: pause() bumps the gen, and the resumed track's natural on_done is the only thing keeping the sentence pump alive — a re-check would halt reading after every online pause/resume. The trace also exposed ISSUE-031 (orthogonal duplicate-read).
+- `play()` is only ever called from a synth thread holding `TTSEngine._gen_lock`, and `TTSEngine.stop()` bumps under that lock before `player.stop()` — so play/stop cannot interleave mid-registration. Use this when reasoning about AudioPlayer races reachable in practice.
+- pyttsx3 callbacks (`started-word`) are invoked on the thread running `runAndWait` — an in-worker `engine.stop()` from the callback preserves the single-owner COM constraint (ISSUE-013) by construction.
 - Python ≥3.11: `asyncio.TimeoutError is TimeoutError` (builtin, an Exception subclass), so `except Exception` catches `asyncio.wait_for` timeouts.
 - Lock-free reads of an int token in CPython are fine (GIL-atomic) as long as all writes are serialized under a lock — don't fail a fix for not locking reads.
-- Re-sorting issues.md: split on `\n---\n`, map sections by `## ISSUE-(\d+)`, reassemble in explicit desired order, assert same length before writing. Safe and fast.
+- Re-sorting issues.md: split on `\n---\n`, map sections by `## ISSUE-(\d+)`, reassemble in explicit desired order, assert same section count AND same sorted-line multiset before writing. Safe and fast.
+- Re-validating a previously-PARTIAL issue: append a second `### Validation (re-validation after ISSUE-NNN)` section; never edit the original Validation.
 
 ## Status Values
 - `VALIDATED ✅` — fix confirmed correct, issue resolved

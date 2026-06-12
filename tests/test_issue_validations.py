@@ -1315,6 +1315,54 @@ class TestIssue025CompletionBookmark(unittest.TestCase):
         finally:
             os.remove(path)
 
+    def test_finish_close_reopen_shows_no_resume_prompt(self):
+        """End-to-end pin of the issue's headline repro for MULTI-PAGE docs:
+        finish document -> close window -> reopen must show no resume prompt.
+
+        This is the path that failed the first validation (PARTIAL verdict):
+        on_close used to re-save {page: last, sentence_idx: 0} after
+        _on_page_done had cleared the bookmark. Resolved by ISSUE-030."""
+        import json as _json
+        import src.app as app_mod
+        fd, path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                _json.dump({"C:/doc.pdf": {"page": 3, "sentence_idx": 6}}, f)
+            app = app_mod.DocumentReaderApp.__new__(app_mod.DocumentReaderApp)
+            app._current_pdf_path = "C:/doc.pdf"
+            app._current_page = 4              # last page (0-based) of 5
+            app._sentence_idx = 0
+            app._reading = True                # last sentence just finished
+            app._paused = False
+            app._pdf = MagicMock()
+            app._pdf.page_count = 5
+            app._tts = MagicMock()
+            app.destroy = MagicMock()
+            app._set_status = MagicMock()
+            app._auto_advance_var = MagicMock()
+            app._auto_advance_var.get.return_value = False
+
+            def fake_stop(completed=False):
+                # state the real _stop(completed=True) leaves behind
+                app._reading = False
+                app._paused = False
+                app._sentence_idx = 0
+
+            app._stop = fake_stop
+            askyesno = MagicMock()
+            with patch.object(app_mod, "_BOOKMARKS_FILE", path):
+                app._on_page_done()   # document completion: clears the bookmark
+                app.on_close()        # must NOT re-save it
+                with patch.object(app_mod.mb, "askyesno", askyesno):
+                    restored = app._restore_bookmark("C:/doc.pdf")
+            self.assertFalse(restored,
+                             "a bookmark entry survived finish->close — the stale "
+                             "resume prompt is back (ISSUE-025)")
+            askyesno.assert_not_called()
+        finally:
+            os.remove(path)
+
 
 # ---------------------------------------------------------------------------
 # ISSUE-026 — MCI dispatcher hardening (worker guard + caller timeouts)
@@ -1348,6 +1396,413 @@ class TestIssue026MciDispatcherHardening(unittest.TestCase):
             except queue.Empty:
                 self.fail("MCI dispatcher did not respond after a malformed item — "
                           "the worker thread died (ISSUE-026)")
+
+
+# ---------------------------------------------------------------------------
+# ISSUE-027 — generation check held across the player handoff (TOCTOU closed)
+# ---------------------------------------------------------------------------
+
+class TestIssue027HandoffGenLock(unittest.TestCase):
+
+    def test_handoff_check_inside_gen_lock(self):
+        """The gen check and _player.play() handoff must happen under _gen_lock."""
+        import src.tts_engine as te
+        src = inspect.getsource(te.TTSEngine._speak_online)
+        lock_pos = src.find("with self._gen_lock:")
+        play_pos = src.find("_player.play(")
+        self.assertNotEqual(lock_pos, -1,
+                            "_speak_online does not hold _gen_lock across the handoff (ISSUE-027)")
+        self.assertNotEqual(play_pos, -1,
+                            "_speak_online never hands off to _player.play()")
+        self.assertLess(lock_pos, play_pos,
+                        "_player.play() must be inside the _gen_lock block (ISSUE-027)")
+
+    def test_stop_serialized_against_handoff(self):
+        """
+        A stop() that bumps the generation while holding _gen_lock must win
+        against a synth thread arriving at the handoff: the utterance must be
+        discarded, never played. Before the fix the check ran outside the
+        lock, so the synth thread saw the pre-bump generation and played.
+        """
+        engine = _make_tts_engine()
+        finished = threading.Event()
+        engine._make_tmp_mp3 = MagicMock(return_value="fake.mp3")
+        engine._delete_tmp = MagicMock(side_effect=lambda p: finished.set())
+
+        async def fake_synth(text, voice_id, rate, out_path):
+            pass
+
+        engine._edge_synthesize = fake_synth
+        voice = MagicMock(source="online", id="v1")
+        played = []
+        # Simulate Stop holding the generation lock while bumping: the synth
+        # thread must serialize at the handoff and then see the stale gen.
+        with engine._gen_lock:
+            engine._speak_online("hello", voice, 1.0, lambda: played.append(1))
+            time.sleep(0.3)  # synth completes and blocks at the handoff lock
+            engine._generation += 1  # Stop's bump, still inside the lock
+        self.assertTrue(finished.wait(timeout=3), "synth thread did not finish")
+        engine._player.play.assert_not_called()
+        self.assertEqual(played, [],
+                         "utterance played despite a Stop landing in the handoff window (ISSUE-027)")
+
+    def test_done_and_cleanup_does_not_recheck_generation(self):
+        """
+        _done_and_cleanup must NOT gate on_done on the generation: pause()
+        bumps it (ISSUE-019), and online pause->resume relies on the natural
+        on_done of that gen-stale-but-resumed utterance to keep the sentence
+        pump alive. The TOCTOU is closed by the lock-held handoff instead.
+        """
+        engine = _make_tts_engine()
+        handed = {}
+        handed_off = threading.Event()
+        engine._make_tmp_mp3 = MagicMock(return_value="fake.mp3")
+        engine._delete_tmp = MagicMock()
+
+        def fake_play(path, on_done=None):
+            handed["cb"] = on_done
+            handed_off.set()
+
+        engine._player.play = MagicMock(side_effect=fake_play)
+
+        async def fake_synth(text, voice_id, rate, out_path):
+            pass
+
+        engine._edge_synthesize = fake_synth
+        done = []
+        voice = MagicMock(source="online", id="v1")
+        engine._speak_online("hello", voice, 1.0, lambda: done.append(1))
+        self.assertTrue(handed_off.wait(timeout=3), "utterance never handed to player")
+        engine._generation += 1  # pause() during playback (ISSUE-019 bump)
+        handed["cb"]()  # resumed playback finishes naturally
+        self.assertEqual(done, [1],
+                         "natural on_done suppressed after a pause/resume generation bump — "
+                         "the sentence pump would halt (ISSUE-027 regression)")
+
+    def test_bump_generation_blocks_until_handoff_completes(self):
+        """
+        The complementary ordering to test_stop_serialized_against_handoff:
+        if the synth thread wins the lock, a concurrent stop()/pause() bump
+        must block until play() has RETURNED (playback registered with the
+        player), never landing between the check and the handoff (ISSUE-027).
+        """
+        engine = _make_tts_engine()
+        engine._make_tmp_mp3 = MagicMock(return_value="fake.mp3")
+        engine._delete_tmp = MagicMock()
+        in_play = threading.Event()
+        release_play = threading.Event()
+
+        def fake_play(path, on_done=None):
+            in_play.set()
+            release_play.wait(timeout=10)
+
+        engine._player.play = MagicMock(side_effect=fake_play)
+
+        async def fake_synth(text, voice_id, rate, out_path):
+            pass
+
+        engine._edge_synthesize = fake_synth
+        voice = MagicMock(source="online", id="v1")
+        engine._speak_online("hello", voice, 1.0, None)
+        self.assertTrue(in_play.wait(timeout=3), "utterance never reached the handoff")
+
+        bumped = threading.Event()
+
+        def do_bump():
+            engine._bump_generation()
+            bumped.set()
+
+        threading.Thread(target=do_bump, daemon=True).start()
+        self.assertFalse(
+            bumped.wait(timeout=0.5),
+            "a generation bump landed DURING the handoff — the check-then-act "
+            "window is not closed (ISSUE-027)")
+        release_play.set()
+        self.assertTrue(bumped.wait(timeout=3),
+                        "bump never completed after play() returned — lock leak")
+
+    def test_play_failure_on_done_not_inline(self):
+        """
+        AudioPlayer.play must not call on_done synchronously on MCI open
+        failure: the calling synth thread may hold _gen_lock across play(),
+        and an inline on_done marshalling to a GUI thread blocked on that
+        lock would deadlock (ISSUE-027).
+        """
+        import src.audio_player as ap
+        old_mci, old_query = ap._mci, ap._mci_query
+        ap._mci = MagicMock(return_value=-1)  # open fails
+        try:
+            player = ap.AudioPlayer()
+            caller = threading.current_thread()
+            fired_on = []
+            fired = threading.Event()
+
+            def on_done():
+                fired_on.append(threading.current_thread())
+                fired.set()
+
+            player.play("missing.mp3", on_done=on_done)
+            self.assertTrue(fired.wait(timeout=3), "failure-path on_done never fired")
+            self.assertIsNot(fired_on[0], caller,
+                             "failure-path on_done fired inline on the calling thread (ISSUE-027)")
+        finally:
+            ap._mci, ap._mci_query = old_mci, old_query
+
+
+# ---------------------------------------------------------------------------
+# ISSUE-028 — per-playback stop event and on_done in AudioPlayer
+# ---------------------------------------------------------------------------
+
+class TestIssue028PerPlaybackStopEvent(unittest.TestCase):
+
+    def _play_source(self):
+        import src.audio_player as ap
+        return inspect.getsource(ap.AudioPlayer.play)
+
+    def test_play_does_not_clear_shared_event(self):
+        """play() must not clear a shared event (the set-then-clear bug)."""
+        self.assertNotIn(".clear()", self._play_source(),
+                         "play() still clears a shared stop event — a monitor that "
+                         "outlives the 2s join can be resurrected (ISSUE-028)")
+
+    def test_play_creates_fresh_event_per_playback(self):
+        self.assertIn("threading.Event()", self._play_source(),
+                      "play() does not create a fresh per-playback Event (ISSUE-028)")
+
+    def test_monitor_uses_captured_on_done(self):
+        """The monitor must capture play()'s on_done, not read a shared slot."""
+        self.assertNotIn("self._on_done", self._play_source(),
+                         "monitor still reads the shared on_done slot — a stale monitor "
+                         "could fire the NEW playback's callback (ISSUE-028)")
+
+    def test_stale_event_stays_set_after_new_play(self):
+        """
+        After stop() + a new play(), the OLD playback's event must remain set
+        (a fresh Event replaces it instead of clearing it), so a stale
+        monitor that outlived the join can never wake into the new playback.
+        """
+        ap = _import_audio_player()
+        player = ap.AudioPlayer()
+        try:
+            player.play("a.mp3")
+            ev_a = player._stop_event
+            player.stop()
+            self.assertTrue(ev_a.is_set(), "stop() did not set the playback's event")
+            player.play("b.mp3")
+            self.assertIsNot(player._stop_event, ev_a,
+                             "play() reused the previous Event object (ISSUE-028)")
+            self.assertTrue(ev_a.is_set(),
+                            "the old playback's event was un-set by the new play() — "
+                            "a stale monitor would be resurrected (ISSUE-028)")
+        finally:
+            player.stop()
+
+    def test_stale_monitor_does_not_clear_new_playback_flags(self):
+        """The monitor must not clear _playing/_paused once its own event is set."""
+        src = self._play_source()
+        self.assertIn("if not stop_event.is_set():", src,
+                      "monitor clears the shared _playing/_paused flags unconditionally — "
+                      "a stale monitor would clobber the new playback's state (ISSUE-028)")
+
+    def test_stale_monitor_surviving_join_cannot_touch_new_playback(self):
+        """
+        Behavioral reproduction of the issue's exact scenario: monitor A is
+        stalled in an MCI query past the 2s join timeout, a new play() B
+        starts, then A wakes. A must exit immediately (its own event is
+        permanently set), fire neither on_done, and leave B's _playing flag
+        alone. Takes ~4.5s (two deliberate join timeouts).
+        """
+        import src.audio_player as ap
+        old_mci, old_query = ap._mci, ap._mci_query
+        release_a = threading.Event()
+        a_in_query = threading.Event()
+        holder = {"monitor_a": None}
+
+        def fake_query(cmd):
+            if (threading.current_thread() is holder["monitor_a"]
+                    and not release_a.is_set()):
+                a_in_query.set()
+                release_a.wait(timeout=15)  # stall monitor A past the join
+            return "playing"
+
+        ap._mci = MagicMock(return_value=0)
+        ap._mci_query = fake_query
+        player = ap.AudioPlayer()
+        try:
+            on_done_a, on_done_b = MagicMock(), MagicMock()
+            with patch.object(ap.log, "warning"), patch.object(ap.log, "error"):
+                player.play("a.mp3", on_done=on_done_a)
+                monitor_a = holder["monitor_a"] = player._monitor_thread
+                self.assertTrue(a_in_query.wait(timeout=3),
+                                "monitor A never reached its MCI query")
+                player.stop()  # join times out after 2s; A survives
+                self.assertTrue(monitor_a.is_alive(),
+                                "test setup failed: monitor A should outlive the join")
+                player.play("b.mp3", on_done=on_done_b)  # second 2s join inside
+                release_a.set()  # A wakes; its own event is already set
+                monitor_a.join(timeout=3)
+            self.assertFalse(monitor_a.is_alive(),
+                             "stale monitor A kept running after waking — its "
+                             "cancellation was un-set by the new play() (ISSUE-028)")
+            on_done_a.assert_not_called()
+            on_done_b.assert_not_called()
+            with player._lock:
+                self.assertTrue(player._playing,
+                                "stale monitor A clobbered the new playback's "
+                                "_playing flag (ISSUE-028)")
+        finally:
+            release_a.set()
+            try:
+                player.stop()
+            except Exception:
+                pass
+            ap._mci, ap._mci_query = old_mci, old_query
+
+
+# ---------------------------------------------------------------------------
+# ISSUE-029 — MCI dispatcher recovery path itself guarded
+# ---------------------------------------------------------------------------
+
+class TestIssue029DispatcherRecoveryGuard(unittest.TestCase):
+
+    def test_worker_validates_result_queue_type(self):
+        import src.audio_player as ap
+        src = inspect.getsource(ap._mci_worker)
+        self.assertIn("isinstance(result_q, queue.Queue)", src,
+                      "_mci_worker does not validate the result queue type (ISSUE-029)")
+
+    def test_worker_survives_two_element_malformed_item(self):
+        """A 2-element item whose second element is not a Queue must not kill the dispatcher."""
+        import src.audio_player as ap
+        with patch.object(ap.log, "exception"):
+            ap._cmd_queue.put(("status fake mode", "not-a-queue"))
+            rq = queue.Queue()
+            ap._cmd_queue.put(("status fake mode", rq))
+            try:
+                rq.get(timeout=3)
+            except queue.Empty:
+                self.fail("MCI dispatcher died on a malformed 2-element item (ISSUE-029)")
+
+    def test_worker_survives_result_queue_put_failure(self):
+        """Even if the failure-path put itself raises, the dispatcher must live."""
+        import src.audio_player as ap
+
+        class ExplodingQueue(queue.Queue):
+            def put(self, *args, **kwargs):
+                raise RuntimeError("boom")
+
+        with patch.object(ap.log, "exception"), patch.object(ap.log, "debug"):
+            ap._cmd_queue.put(("status fake mode", ExplodingQueue()))
+            rq = queue.Queue()
+            ap._cmd_queue.put(("status fake mode", rq))
+            try:
+                rq.get(timeout=3)
+            except queue.Empty:
+                self.fail("MCI dispatcher died when the recovery put raised (ISSUE-029)")
+
+
+# ---------------------------------------------------------------------------
+# ISSUE-030 — on_close only saves a bookmark for in-progress reading
+# ---------------------------------------------------------------------------
+
+class TestIssue030CloseBookmarkGate(unittest.TestCase):
+
+    def _make_app(self):
+        import src.app as app_mod
+        app = app_mod.DocumentReaderApp.__new__(app_mod.DocumentReaderApp)
+        app._reading = False
+        app._paused = False
+        app._sentence_idx = 0
+        app._current_page = 4
+        app._current_pdf_path = "C:/doc.pdf"
+        app._tts = MagicMock()
+        app._pdf = MagicMock()
+        app.destroy = MagicMock()
+        return app
+
+    def test_on_close_gates_save_on_reading_state(self):
+        import src.app as app_mod
+        src = inspect.getsource(app_mod.DocumentReaderApp.on_close)
+        self.assertIn("self._reading or self._paused", src,
+                      "on_close does not gate _save_bookmark on in-progress "
+                      "reading state (ISSUE-030)")
+
+    def test_idle_close_does_not_save(self):
+        """Closing after Stop or after completion must not (re-)save a bookmark."""
+        import src.app as app_mod
+        app = self._make_app()
+        with patch.object(app_mod.DocumentReaderApp, "_save_bookmark") as save:
+            app.on_close()
+        save.assert_not_called()
+
+    def test_close_mid_read_still_saves_rewound_position(self):
+        import src.app as app_mod
+        app = self._make_app()
+        app._reading = True
+        app._sentence_idx = 5
+        with patch.object(app_mod.DocumentReaderApp, "_save_bookmark") as save:
+            app.on_close()
+        save.assert_called_once()
+        self.assertEqual(app._sentence_idx, 4,
+                         "ISSUE-020 rewind regressed: close mid-read must bookmark "
+                         "the interrupted sentence")
+
+    def test_close_while_paused_saves_without_double_rewind(self):
+        import src.app as app_mod
+        app = self._make_app()
+        app._reading = True
+        app._paused = True
+        app._sentence_idx = 3  # already rewound by _pause
+        with patch.object(app_mod.DocumentReaderApp, "_save_bookmark") as save:
+            app.on_close()
+        save.assert_called_once()
+        self.assertEqual(app._sentence_idx, 3,
+                         "close-while-paused must not rewind again (idx was already "
+                         "rewound by _pause)")
+
+    def test_close_after_completion_keeps_bookmark_cleared(self):
+        """Behavioral: a bookmark cleared on completion must stay cleared after close."""
+        import json as _json
+        import src.app as app_mod
+        fd, path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                _json.dump({"C:/other.pdf": {"page": 0, "sentence_idx": 5}}, f)
+            app = self._make_app()  # idle, as left by _stop(completed=True)
+            with patch.object(app_mod, "_BOOKMARKS_FILE", path):
+                app.on_close()
+            with open(path, encoding="utf-8") as f:
+                data = _json.load(f)
+            self.assertNotIn("C:/doc.pdf", data,
+                             "on_close re-created the bookmark that completion "
+                             "cleared (ISSUE-030)")
+        finally:
+            os.remove(path)
+
+    def test_close_after_stop_preserves_stop_saved_bookmark(self):
+        """Behavioral: the rewound position saved by a manual Stop must survive close.
+
+        Before the fix, on_close re-saved {page: current, sentence_idx: 0}
+        (idx was reset by _stop), clobbering the Stop-saved position."""
+        import json as _json
+        import src.app as app_mod
+        fd, path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        try:
+            stop_saved = {"page": 4, "sentence_idx": 7}
+            with open(path, "w", encoding="utf-8") as f:
+                _json.dump({"C:/doc.pdf": dict(stop_saved)}, f)
+            app = self._make_app()  # idle with _sentence_idx=0, as left by _stop()
+            with patch.object(app_mod, "_BOOKMARKS_FILE", path):
+                app.on_close()
+            with open(path, encoding="utf-8") as f:
+                data = _json.load(f)
+            self.assertEqual(data.get("C:/doc.pdf"), stop_saved,
+                             "on_close clobbered the Stop-saved bookmark with "
+                             "sentence_idx=0 (ISSUE-030)")
+        finally:
+            os.remove(path)
 
 
 if __name__ == "__main__":

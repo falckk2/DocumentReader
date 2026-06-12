@@ -34,6 +34,12 @@ def _mci_worker() -> None:
         # caller) nor orphan the current caller blocked on its result queue.
         try:
             cmd, result_q = item
+            # ISSUE-029 fix: a malformed item that unpacks into two elements
+            # but carries a non-Queue would otherwise reach the execute
+            # block, where BOTH result_q.put calls raise — the second one
+            # uncaught, killing the dispatcher. Reject it here instead.
+            if not isinstance(result_q, queue.Queue):
+                raise TypeError(f"result queue is {type(result_q).__name__}, expected queue.Queue")
         except Exception:
             log.exception("Malformed MCI command item ignored: %r", item)
             continue
@@ -45,7 +51,13 @@ def _mci_worker() -> None:
             result_q.put((ret, buf.value.strip()))
         except Exception:
             log.exception("MCI dispatcher error executing %r", cmd)
-            result_q.put((-1, ""))
+            # ISSUE-029 fix: the recovery path must itself be guarded — if
+            # answering the caller fails too, log and keep the dispatcher
+            # alive rather than letting the exception kill the thread.
+            try:
+                result_q.put((-1, ""))
+            except Exception:
+                log.exception("MCI dispatcher could not deliver failure result for %r", cmd)
 
 
 _worker = threading.Thread(target=_mci_worker, daemon=True)
@@ -87,7 +99,6 @@ class AudioPlayer:
         self._playing = False
         self._paused = False
         self._stop_event = threading.Event()
-        self._on_done = None
         self._monitor_thread: threading.Thread | None = None
         self._open = False
         self._lock = threading.Lock()
@@ -95,8 +106,15 @@ class AudioPlayer:
     def play(self, filepath: str, on_done=None):
         """Load and play an MP3 file. Calls on_done() when it finishes naturally."""
         self.stop()
-        self._stop_event.clear()
-        self._on_done = on_done
+        # ISSUE-028 fix: per-playback cancellation event (mirrors the
+        # ISSUE-017 generation-token design). stop() sets the CURRENT
+        # event; each play() creates a fresh one instead of clearing a
+        # shared event, so a stale monitor that outlived the 2s join
+        # timeout still sees its own permanently-set event and its own
+        # captured on_done — it can never observe (or advance) the new
+        # playback.
+        stop_event = threading.Event()
+        self._stop_event = stop_event
 
         abs_path = os.path.abspath(filepath).replace("/", "\\")
 
@@ -104,9 +122,15 @@ class AudioPlayer:
         _mci(f'close {_ALIAS}')
         ret = _mci(f'open "{abs_path}" type mpegvideo alias {_ALIAS}')
         if ret != 0:
-            log.error("MCI open failed (ret=%d) for %s; firing on_done immediately", ret, abs_path)
+            log.error("MCI open failed (ret=%d) for %s; dispatching on_done", ret, abs_path)
             if on_done:
-                on_done()
+                # ISSUE-027 fix: never invoke the caller's callback inline.
+                # The calling synth thread may hold TTSEngine._gen_lock
+                # across this play() call; an inline on_done would marshal
+                # to the GUI thread (event_generate) while a GUI-side stop()
+                # blocks on that same lock — a deadlock. Dispatch detached,
+                # matching the ISSUE-022 monitor dispatch.
+                threading.Thread(target=on_done, daemon=True, name="on-done-dispatch").start()
             return
 
         with self._lock:
@@ -130,7 +154,11 @@ class AudioPlayer:
                 log.warning("Could not read track length; position-based end detection disabled")
             log.debug("Monitor started: track_length=%dms", track_length)
 
-            while not self._stop_event.is_set():
+            # ISSUE-028 fix: the monitor observes only its own playback's
+            # stop_event and on_done (captured from the enclosing play()
+            # call), never the shared instance slots a newer play() would
+            # have reassigned.
+            while not stop_event.is_set():
                 time.sleep(0.1)
                 with self._lock:
                     if not self._open:
@@ -146,17 +174,23 @@ class AudioPlayer:
                 if track_length and pos >= track_length:
                     # Give the audio output buffer time to drain
                     for _ in range(5):
-                        if self._stop_event.is_set():
+                        if stop_event.is_set():
                             break
                         time.sleep(0.05)
                     break
 
             with self._lock:
-                self._playing = False
-                self._paused = False
-            cb = self._on_done if not self._stop_event.is_set() else None
+                # ISSUE-028 fix: only clear the shared flags when this
+                # monitor's playback is still current. If stop_event is set,
+                # stop() already cleared them — and a newer play() may have
+                # set them again for ITS playback, which a stale monitor
+                # must not clobber.
+                if not stop_event.is_set():
+                    self._playing = False
+                    self._paused = False
+            cb = on_done if not stop_event.is_set() else None
             log.debug("Monitor exiting (stop_event=%s, will_fire_on_done=%s)",
-                      self._stop_event.is_set(), bool(cb))
+                      stop_event.is_set(), bool(cb))
             if cb:
                 # ISSUE-022 fix: fire on_done from a detached dispatcher thread.
                 # The on_done chain ends in app.event_generate(), which blocks

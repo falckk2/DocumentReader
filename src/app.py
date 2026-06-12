@@ -589,15 +589,24 @@ class DocumentReaderApp(ctk.CTk):
         return True
 
     def on_close(self):
-        log.info("Window closing; saving bookmark and tearing down "
+        log.info("Window closing; tearing down "
                  "(reading=%s, paused=%s, idx=%d)",
                  self._reading, self._paused, self._sentence_idx)
-        # ISSUE-020 fix: apply the same ISSUE-007 rewind as _pause/_stop —
-        # when closing mid-sentence, _sentence_idx points at the NEXT
-        # sentence, so rewind by one to bookmark the interrupted one.
-        if self._reading and not self._paused and self._sentence_idx > 0:
-            self._sentence_idx -= 1
-        self._save_bookmark()
+        # ISSUE-030 fix: only save when reading is actually in progress.
+        # An idle close has nothing new to record: after a manual Stop the
+        # rewound position was already saved (an unconditional save here
+        # clobbered it with sentence 0), and after natural completion
+        # _on_page_done cleared/advanced the bookmark (an unconditional
+        # save resurrected the cleared entry as a stale resume prompt).
+        # _stop(completed=True) leaves _reading and _paused False, so both
+        # idle cases are covered by this single gate.
+        if self._reading or self._paused:
+            # ISSUE-020 fix: apply the same ISSUE-007 rewind as _pause/_stop —
+            # when closing mid-sentence, _sentence_idx points at the NEXT
+            # sentence, so rewind by one to bookmark the interrupted one.
+            if self._reading and not self._paused and self._sentence_idx > 0:
+                self._sentence_idx -= 1
+            self._save_bookmark()
         self._tts.stop()
         self._pdf.close()
         self.destroy()

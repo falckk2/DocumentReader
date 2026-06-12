@@ -133,16 +133,32 @@ class TTSEngine:
                 log.debug("edge-tts synth start: gen=%d voice=%s rate=%s -> %s",
                           gen, voice.id, rate_str, tmp)
                 asyncio.run(self._edge_synthesize(text, voice.id, rate_str, tmp))
-                if gen == self._generation:
-                    log.debug("edge-tts synth done, handing to player: gen=%d %s", gen, tmp)
-                    # Wrap on_done to clean up this specific tmp file after playback.
-                    def _done_and_cleanup():
-                        log.debug("Playback finished for utterance gen=%d", gen)
-                        self._delete_tmp(tmp)
-                        if on_done:
-                            on_done()
-                    self._player.play(tmp, on_done=_done_and_cleanup)
-                else:
+                # ISSUE-027 fix: hold _gen_lock across the generation check
+                # AND the handoff to the player. stop()/pause() bump the
+                # generation under the same lock, so a bump either lands
+                # before the check (this utterance is discarded) or after
+                # play() returns (the playback is then registered with the
+                # player, so player.stop() kills it and its monitor
+                # suppresses on_done) — the check-then-act window is gone.
+                # Holding the lock here is safe because play() never invokes
+                # on_done inline (its failure path dispatches on a detached
+                # thread). NOTE: _done_and_cleanup deliberately does NOT
+                # re-check the generation: pause() bumps it (ISSUE-019) and
+                # the online pause->resume path relies on the natural
+                # on_done of that gen-stale-but-resumed utterance to keep
+                # the sentence pump alive.
+                with self._gen_lock:
+                    current = gen == self._generation
+                    if current:
+                        log.debug("edge-tts synth done, handing to player: gen=%d %s", gen, tmp)
+                        # Wrap on_done to clean up this specific tmp file after playback.
+                        def _done_and_cleanup():
+                            log.debug("Playback finished for utterance gen=%d", gen)
+                            self._delete_tmp(tmp)
+                            if on_done:
+                                on_done()
+                        self._player.play(tmp, on_done=_done_and_cleanup)
+                if not current:
                     # Cancelled by stop()/pause()/a newer speak() while
                     # synthesizing: discard without playing or firing on_done.
                     log.debug("edge-tts synth done but utterance gen=%d is stale "
