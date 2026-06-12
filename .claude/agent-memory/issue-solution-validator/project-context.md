@@ -15,7 +15,7 @@ metadata:
 
 ## Test Infrastructure
 - Test runner: `python -m unittest` (pytest not installed)
-- Test file: `tests/test_issue_validations.py` (138 tests as of 2026-06-12 night; all green; ~6s runtime — the ISSUE-028 stale-monitor test alone takes ~4.5s by design, two deliberate 2s join timeouts)
+- Test file: `tests/test_issue_validations.py` (153 tests as of 2026-06-12; all green; ~6s runtime — the ISSUE-028 stale-monitor test alone takes ~4.5s by design, two deliberate 2s join timeouts)
 - Tests mix code inspection (`inspect.getsource`) with behavioral tests built on `Class.__new__` + stubbed attributes — no live GUI, MCI, or TTS
 - `ctypes.WinDLL` is patched at module level in the test file before `src.audio_player` is imported
 - Behavioral AudioPlayer tests: patch module-level `ap._mci = MagicMock(return_value=0)` and `ap._mci_query = MagicMock(return_value="stopped")`, then `player.play(...)` runs the real monitor loop which exits quickly on "stopped"
@@ -36,4 +36,5 @@ The two `KeyError: 'src.tts_engine'` errors in `TestIssue002TmpFileLock` were fi
 ## Issues File
 - `issues.md` in project root — tracks all issues found by `bug-detective`, fixed by `issue-fixer`, validated by this agent
 - Sort rule (header line): OPEN → NEEDS_REVIEW → FIXED → PARTIAL → VALIDATED; entries are separated by lines that are exactly `---`, so the file can be safely re-sorted by splitting on `\n---\n` (verified: no section body contains a bare `---` line)
-- As of 2026-06-12 (night): 0 OPEN, 1 NEEDS_REVIEW (016), 1 PARTIAL (011), 29 VALIDATED (001-010, 012-015, 017-031). Next free ID: ISSUE-032.
+- As of 2026-06-12 (latest): 0 OPEN, 0 NEEDS_REVIEW, 0 FIXED, 1 PARTIAL (011), 30 VALIDATED (001-010, 012-031). Next free ID: ISSUE-032.
+- Within the VALIDATED group, newly validated entries are APPENDED at the end (025, 031, 016 are out of numeric order by convention), so don't "fix" the ordering.

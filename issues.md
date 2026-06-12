@@ -6,24 +6,6 @@ Issues are sorted by status: OPEN → NEEDS_REVIEW → FIXED → PARTIAL → VAL
 
 ---
 
-## ISSUE-016 — Speed/voice changes mid-playback not reflected until next sentence
-
-**Status**: NEEDS_REVIEW
-**Severity**: LOW
-
-### Discovery
-- **File**: `src/app.py` — `_on_voice_change` ~line 373, `_on_speed_change` ~line 376, `_read_next_sentence`
-- **Description**: Voice and speed are read at the start of each sentence (`_read_next_sentence`). Changing the slider or dropdown mid-sentence has no effect until the next sentence boundary. This matches the documented design ("Voice selection reads from dropdown at speak time"), so it is intentional — flagged only because there is no user feedback that the change is queued, which users may report as a bug.
-- **Root Cause**: Intentional design; no UI affordance indicating deferred application.
-- **Impact**: User confusion ("I moved the slider, nothing happened").
-- **Reproduction**: Start playback, drag speed slider; current sentence speed unchanged.
-- **Depends On**: None
-- **Fix Suggestion**: Optionally show a transient status like "Speed applies to next sentence", or re-synth the current sentence on change. Confirm desired behavior before changing.
-- **Logging Added**: `_read_next_sentence` logs the speed/voice used per sentence, making the deferral visible in logs.
-- **Date Found**: 2026-06-02
-
----
-
 ## ISSUE-011 — End-of-track detection relies on position polling (latency between sentences)
 
 **Status**: PARTIAL ⚠️
@@ -1100,6 +1082,44 @@ Issues are sorted by status: OPEN → NEEDS_REVIEW → FIXED → PARTIAL → VAL
   - ✅ test_double_pause_resume_cycle_stays_consistent — no index drift across repeated cycles
 - **Inspection**: `git diff` confirms the fix is exactly the 10 lines described, in `_play()`'s resume else-branch only (src/app.py:314-323); no other source file changed. Traced all four interaction paths: (1) ISSUE-019 mid-synthesis pause — `TTSEngine.pause()` bumps the generation under `_gen_lock` before `_speak_online`'s check-and-play block can hand off, so the synth discards and `_player.play()` never runs; `is_playing` is therefore False after `resume()` and the re-advance correctly does NOT fire (the lock permits only two orderings: discard-before-play → offline-style re-read, or bump-after-play → audio was already playing, i.e. the mid-audio case — both handled). (2) ISSUE-027 — `_done_and_cleanup` in tts_engine.py is untouched and still has no generation re-check, with the NOTE comment explicitly documenting that this resume path depends on the gen-stale-but-resumed utterance's natural on_done. (3) Interrupted last sentence — rewound to L-1, re-advanced to L; the natural on_done routes through `_read_next_sentence`'s `idx >= len` branch into `_on_page_done`, where the ISSUE-025/030 bookmark logic (clear on document end, next-page save otherwise, `_stop(completed=True)` skipping the rewind-save) applies correctly since the sentence was fully heard. (4) Page navigation while paused — `_prev_page`/`_next_page` call `_stop()` first, clearing `_paused`, so the re-advance can never fire against a swapped sentence list. The `< len(self._sentences)` clamp is defensive (a rewound index is always < len in reachable states) and correct. `_reading` remains True across pause/resume (only `_stop` clears it), so the on_done chain stays live without the else-branch needing to set it.
 - **Verdict**: Fix is confirmed correct and complete. The online mid-audio pause/resume duplicate read is gone, and the offline, mid-synthesis, bookmark, page-end, and repeated-cycle paths are all preserved.
+- **New Issues**: None
+
+---
+
+## ISSUE-016 — Speed/voice changes mid-playback not reflected until next sentence
+
+**Status**: VALIDATED ✅
+**Severity**: LOW
+
+### Discovery
+- **File**: `src/app.py` — `_on_voice_change` ~line 373, `_on_speed_change` ~line 376, `_read_next_sentence`
+- **Description**: Voice and speed are read at the start of each sentence (`_read_next_sentence`). Changing the slider or dropdown mid-sentence has no effect until the next sentence boundary. This matches the documented design ("Voice selection reads from dropdown at speak time"), so it is intentional — flagged only because there is no user feedback that the change is queued, which users may report as a bug.
+- **Root Cause**: Intentional design; no UI affordance indicating deferred application.
+- **Impact**: User confusion ("I moved the slider, nothing happened").
+- **Reproduction**: Start playback, drag speed slider; current sentence speed unchanged.
+- **Depends On**: None
+- **Fix Suggestion**: Optionally show a transient status like "Speed applies to next sentence", or re-synth the current sentence on change. Confirm desired behavior before changing.
+- **Logging Added**: `_read_next_sentence` logs the speed/voice used per sentence, making the deferral visible in logs.
+- **Date Found**: 2026-06-02
+
+### Fix
+- **Date**: 2026-06-12
+- **Changes**: User decision (2026-06-12): of the two suggested options, the "re-synth the current sentence on change" behavior was chosen for SPEED only; voice changes remain deferred to the next sentence (documented design, unchanged). In `src/app.py`: `_on_speed_change` now debounces a restart via `self.after(300, self._apply_speed_change)` — each slider tick cancels the previously scheduled timer (`after_cancel`), so a continuous drag triggers exactly one restart on the settled value. New `_apply_speed_change` re-checks state at fire time (`_reading and not _paused and _sentence_idx > 0 and _sentences` — the user may pause/stop within the debounce window), then rewinds `_sentence_idx` by 1 (ISSUE-007 post-increment) and calls `_read_next_sentence()`, which re-speaks the current sentence at the new speed. `_tts.speak()`'s internal `stop()` cancels the in-flight utterance for both backends (generation bump ISSUE-017 for online; started-word interrupt flag ISSUE-018 for offline — verified the worker also suppresses on_done via the still-set interrupt flag). The debounce id is a new `_speed_debounce_id` field, kept separate from `_pending_after_id` (sentence pump), and is cancelled in `_stop()`. GUI-thread-only: slider callbacks and after-callbacks both run on the GUI thread (ISSUE-003 preserved), so the restart and any `<<SentenceDone>>` event serialize — a stale done landing after a restart advances normally with no skip or double rewind. Tests: updated `TestIssue016SpeedVoiceDeferral` (status check now expects FIXED) and added `TestIssue016ImmediateSpeedApply` (11 tests: debounce scheduling/cancelling, fire-time guards, stop cancellation, voice path unchanged) in `tests/test_issue_validations.py`.
+
+### Validation
+- **Date**: 2026-06-12
+- **Method**: Tests + code inspection
+- **Tests**: `tests/test_issue_validations.py` — `TestIssue016ImmediateSpeedApply` (11 fixer tests + 4 added during validation: test_paused_slider_tick_cancels_pending_debounce_without_reschedule, test_restart_respeaks_current_sentence_at_new_speed, test_restart_then_stale_done_continues_with_following_sentence, test_done_then_restart_respeaks_just_started_sentence — the last three drive the REAL `_read_next_sentence` to verify the restart end-to-end and both GUI-thread orderings of debounce-vs-queued-done), `TestIssue016SpeedVoiceDeferral` (3; status test updated to expect VALIDATED)
+- **Results**: 18 passed, 0 failed (ISSUE-016 classes); full suite 153 passed, 0 failed, 0 errors
+  - ✅ test_slider_schedules_debounced_restart_while_reading / test_slider_cancels_prior_pending_debounce — continuous drag yields exactly one after(300) restart on the settled value
+  - ✅ test_slider_does_not_schedule_when_not_reading / when_paused / test_paused_slider_tick_cancels_pending_debounce_without_reschedule — idle/paused ticks never schedule, and a tick after pausing also cancels a pending restart
+  - ✅ test_debounced_fire_rewinds_and_restarts_current_sentence / no_restart_when_paused_at_fire_time / when_stopped_at_fire_time / at_idx_zero / with_no_sentences — fire-time guards: no restart, no rewind, no underflow
+  - ✅ test_stop_cancels_pending_speed_debounce — `_stop` cancels `_speed_debounce_id` eagerly
+  - ✅ test_restart_respeaks_current_sentence_at_new_speed — real pump: speaks `_sentences[idx-1]` with the new slider value, idx unchanged net
+  - ✅ test_restart_then_stale_done_continues_with_following_sentence / test_done_then_restart_respeaks_just_started_sentence — both GUI-thread orderings benign: spoken sequences ["s1","s2"] and ["s2","s2"], final idx identical, no skip/double-advance
+  - ✅ test_voice_change_does_not_schedule_restart / test_voice_change_handler_is_pass — voice path untouched
+- **Inspection**: `git diff` confirms the source change is exactly the four described blocks in `src/app.py` (init field line 45, `_stop` cancel lines 380-382, `_on_speed_change` lines 501-513, new `_apply_speed_change` lines 515-542); no other source file changed. (1) Debounce: `_speed_debounce_id` is a distinct field only ever cancelled by `_on_speed_change`, `_stop`, and self-cleared at fire; Tk after-ids are unique, so no collision with `_pending_after_id` is possible. (2) Fire-time guards re-check `_reading`/`_paused`/`idx>0`/`_sentences`; pause inside the window is caught by the guard (and `_stop` additionally cancels + zeroes idx — triple protection); a quick pause→resume inside the window harmlessly restarts the interrupted sentence at the new speed. Traced the page-boundary race: if the debounce fires while the last sentence's done event is queued (idx==len), the restart re-speaks the already-fully-heard last sentence and the subsequent done routes to `_on_page_done`, which either kills it via `_stop(completed=True)` (also cancelling any later debounce) or auto-advances — no content loss, no double `_on_page_done`. The theoretical restart-utterance-completes-before-the-queued-done interleaving requires a full synth+playback inside one GUI event-loop pass — unreachable, same class as the accepted ISSUE-027 residual. (3) Backend interruption confirmed: `speak()`→`stop()` bumps the generation under `_gen_lock` (online mid-synth discards at the ISSUE-027 locked handoff; mid-playback is killed by `_player.stop()` with the ISSUE-028 per-playback event suppressing its on_done) and sets `_pyttsx3_interrupt` (started-word `engine.stop()` in-worker, on_done suppressed by the still-set flag AND the ISSUE-017 gen gate) — no overlapping audio, no double on_done. (4) Regressions: `_pause`/`_stop` rewinds (ISSUE-007), pause-gen-bump (ISSUE-019), completion bookmarks (ISSUE-025), `on_close` gate (ISSUE-030), and the ISSUE-031 resume re-advance are all untouched; the `TestIssue031._make_app` addition of `_speed_debounce_id = None` mirrors real post-`__init__` state and changes no behavioral assertion (verified in the diff).
+- **Verdict**: Fix is confirmed correct and complete. Speed changes apply immediately via a properly debounced, fully guarded restart of the in-flight sentence; voice changes remain deferred; no regression found.
 - **New Issues**: None
 
 ---

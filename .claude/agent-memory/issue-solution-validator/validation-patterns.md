@@ -53,6 +53,11 @@ Test `test_restore_bookmark_clamps_sentence_idx` checks for `'min('` in source. 
 - Re-sorting issues.md: split on `\n---\n`, map sections by `## ISSUE-(\d+)`, reassemble in explicit desired order, assert same section count AND same sorted-line multiset before writing. Safe and fast.
 - Re-validating a previously-PARTIAL issue: append a second `### Validation (re-validation after ISSUE-NNN)` section; never edit the original Validation.
 
+## GUI-thread serialization reasoning (ISSUE-016, validated 2026-06-12)
+- Tk after-timer callbacks vs queued `<<...>>` virtual events on the GUI thread have NO guaranteed relative order (Tcl checks timers first when both are due) — validate BOTH orderings explicitly. Best test pattern: `__new__`-built app with the REAL `_read_next_sentence` (mock only `_tts`/`_voices`), then call the two handlers in each order and assert the spoken-sentence sequence + final index.
+- A "stale done" queued in Tk's event queue is beyond generation-bump suppression (the bump gates on_done BEFORE event_generate); app-level effects of an already-queued done must be argued benign, not assumed suppressed.
+- Debounced-restart pattern (`after(300)` + cancel-on-tick + fire-time state re-check + cancel in `_stop`) is the validated shape for "apply control change to in-flight sentence". The fire-time guard set is `_reading / not _paused / idx>0 / sentences truthy`; `_stop` gives triple protection (cancel + flag + idx=0). Distinct after-id fields can't collide — Tk after ids are unique per scheduled callback.
+
 ## Status Values
 - `VALIDATED ✅` — fix confirmed correct, issue resolved
 - `PARTIAL ⚠️` — known remaining gap documented, partial fix is correct

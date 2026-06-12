@@ -35,10 +35,15 @@ metadata:
 
 **How to apply:** When adding any new callback or inter-thread communication path, verify which thread it runs on before touching shared state or Tk widgets; gate any deferred callback on the current generation; never let the GUI thread wait unboundedly on another thread.
 
+## Settled design decisions (do not re-litigate)
+
+- ISSUE-016 (user decision 2026-06-12): SPEED slider changes apply IMMEDIATELY during playback via a 300ms-debounced restart of the current sentence (`_apply_speed_change` in app.py, debounce id `_speed_debounce_id`, cancelled in `_stop`). VOICE changes stay deferred to the next sentence — that is intentional design, and `test_voice_change_handler_is_pass` pins it.
+
 ## Test suite gotchas
 
 - `tests/test_issue_validations.py` uses source-inspection assertions: substrings in comments can trip `assertNotIn` checks (e.g. a comment containing `self.after(` failed a test). Word comments carefully in fixed code.
-- The old 2 test ERRORs (`KeyError: 'src.tts_engine'` in TestIssue002) were fixed by the validator on 2026-06-12 (explicit import in setUp); as of the 2026-06-12 batch the suite baseline is fully green (126 tests after ISSUE-027..030).
+- Many app tests build `DocumentReaderApp.__new__(...)` and hand-set only the fields the method under test touches. Adding a NEW instance field to app.py that an existing method (e.g. `_stop`) reads will break those helpers with a confusing `RecursionError` (uninitialized CTk `__getattr__` recurses on missing attributes), not AttributeError. After adding any instance field, grep the test file for `_make_app` helpers exercising the methods that read it and set the field there (hit this with `_speed_debounce_id` + TestIssue031's `_stop` test).
+- The old 2 test ERRORs (`KeyError: 'src.tts_engine'` in TestIssue002) were fixed by the validator on 2026-06-12 (explicit import in setUp); as of ISSUE-016's fix (2026-06-12) the suite baseline is fully green at 149 tests.
 - pytest is NOT installed (Python 3.14); run the suite with `python -m unittest tests.test_issue_validations`.
 - `test_queue_command_format` / ISSUE-013 tests pin the pyttsx3 queue tuple `("speak", text, voice_id, rate_wpm, on_done)` — extend behavior via closures over on_done, not by changing the tuple.
 

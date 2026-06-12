@@ -1,6 +1,7 @@
 """
 Validation tests for DocumentReader issues.md — all 14 resolved issues
-plus checks on ISSUE-011 (Partially Resolved) and ISSUE-016 (NEEDS_REVIEW).
+plus checks on ISSUE-011 (Partially Resolved) and ISSUE-016 (FIXED 2026-06-12:
+speed applies immediately via debounced restart; voice stays deferred).
 
 Scope: code-inspection unit tests only.  No GUI, no MCI device, no live TTS.
 Where a real device or display would be needed the test inspects source
@@ -777,8 +778,11 @@ class TestIssue015PDFEncryptionAndPageErrors(unittest.TestCase):
 
 class TestIssue016SpeedVoiceDeferral(unittest.TestCase):
     """
-    ISSUE-016 is by-design: changes take effect on next sentence.
-    These tests confirm the behaviour is STILL deferred (no surprise early-apply).
+    ISSUE-016 (fixed 2026-06-12, user decision): SPEED changes apply
+    immediately during playback via a debounced restart of the current
+    sentence; VOICE changes remain deferred to the next sentence by design.
+    These tests confirm the voice path is STILL deferred and that
+    _read_next_sentence still reads both controls at speak time.
     """
 
     def test_voice_change_handler_is_pass(self):
@@ -800,8 +804,8 @@ class TestIssue016SpeedVoiceDeferral(unittest.TestCase):
         self.assertIn("_voice_var.get()", src,
                       "_read_next_sentence does not read _voice_var at speak time")
 
-    def test_issue_016_status_is_needs_review(self):
-        """Confirm ISSUE-016 still carries NEEDS_REVIEW — no fix applied yet."""
+    def test_issue_016_status_is_validated(self):
+        """ISSUE-016 was fixed and validated on 2026-06-12 (immediate speed apply)."""
         issues_path = os.path.join(PROJECT_ROOT, "issues.md")
         with open(issues_path, encoding="utf-8") as f:
             content = f.read()
@@ -810,8 +814,209 @@ class TestIssue016SpeedVoiceDeferral(unittest.TestCase):
         )
         self.assertIsNotNone(section_match, "ISSUE-016 section not found in issues.md")
         section = section_match.group()
-        self.assertIn("NEEDS_REVIEW", section,
-                      "ISSUE-016 status changed from NEEDS_REVIEW without this test being updated")
+        self.assertIn("**Status**: VALIDATED", section,
+                      "ISSUE-016 should be marked VALIDATED (immediate speed apply, 2026-06-12)")
+
+
+class TestIssue016ImmediateSpeedApply(unittest.TestCase):
+    """
+    ISSUE-016 fix: moving the speed slider during active reading schedules a
+    DEBOUNCED (300ms) restart of the current sentence at the new speed.
+    The debounced callback re-checks state at fire time; _stop cancels any
+    pending debounce.  Voice changes do not trigger a restart.
+    """
+
+    def _make_app(self, reading=True, paused=False, sentence_idx=2,
+                  sentences=None, debounce_id=None):
+        import src.app as app_mod
+        app = app_mod.DocumentReaderApp.__new__(app_mod.DocumentReaderApp)
+        app._sentences = sentences if sentences is not None else ["s0", "s1", "s2"]
+        app._sentence_idx = sentence_idx
+        app._reading = reading
+        app._paused = paused
+        app._speed_debounce_id = debounce_id
+        app._speed_display = MagicMock()
+        app._speed_var = MagicMock()
+        app._speed_var.get.return_value = 1.5
+        app.after = MagicMock(return_value="after#1")
+        app.after_cancel = MagicMock()
+        app._read_next_sentence = MagicMock()
+        return app
+
+    # -- slider callback (scheduling / debounce) --------------------------
+
+    def test_slider_schedules_debounced_restart_while_reading(self):
+        app = self._make_app(reading=True, paused=False)
+        app._on_speed_change(1.5)
+        app.after.assert_called_once_with(300, app._apply_speed_change)
+        self.assertEqual(app._speed_debounce_id, "after#1")
+        # Restart must be deferred, never inline from the slider tick.
+        app._read_next_sentence.assert_not_called()
+
+    def test_slider_cancels_prior_pending_debounce(self):
+        """A drag fires the callback continuously; each tick must cancel the
+        previously scheduled restart so only the settled value triggers one."""
+        app = self._make_app(reading=True, paused=False, debounce_id="old#0")
+        app._on_speed_change(1.5)
+        app.after_cancel.assert_called_once_with("old#0")
+        self.assertEqual(app._speed_debounce_id, "after#1")
+
+    def test_slider_does_not_schedule_when_not_reading(self):
+        app = self._make_app(reading=False)
+        app._on_speed_change(1.5)
+        app.after.assert_not_called()
+        self.assertIsNone(app._speed_debounce_id)
+        # Display label still updates while idle.
+        app._speed_display.configure.assert_called_once()
+
+    def test_slider_does_not_schedule_when_paused(self):
+        """While paused no restart is needed — resume / the next sentence
+        read the slider value naturally."""
+        app = self._make_app(reading=True, paused=True)
+        app._on_speed_change(1.5)
+        app.after.assert_not_called()
+        self.assertIsNone(app._speed_debounce_id)
+
+    # -- debounced callback (fire-time behaviour) -------------------------
+
+    def test_debounced_fire_rewinds_and_restarts_current_sentence(self):
+        """ISSUE-007: idx was post-incremented past the in-flight sentence,
+        so the restart must rewind exactly one and re-speak it."""
+        app = self._make_app(reading=True, paused=False, sentence_idx=2)
+        app._apply_speed_change()
+        self.assertEqual(app._sentence_idx, 1,
+                         "restart must rewind the post-incremented index by one")
+        app._read_next_sentence.assert_called_once()
+        self.assertIsNone(app._speed_debounce_id)
+
+    def test_debounced_fire_no_restart_when_paused_at_fire_time(self):
+        """State must be re-checked at FIRE time: the user may pause during
+        the 300ms debounce window."""
+        app = self._make_app(reading=True, paused=True, sentence_idx=2)
+        app._apply_speed_change()
+        self.assertEqual(app._sentence_idx, 2, "paused fire must not rewind")
+        app._read_next_sentence.assert_not_called()
+
+    def test_debounced_fire_no_restart_when_stopped_at_fire_time(self):
+        app = self._make_app(reading=False, paused=False, sentence_idx=2)
+        app._apply_speed_change()
+        self.assertEqual(app._sentence_idx, 2)
+        app._read_next_sentence.assert_not_called()
+
+    def test_debounced_fire_no_restart_at_idx_zero(self):
+        """idx == 0 means nothing has been spoken yet — nothing to restart,
+        and rewinding would go negative."""
+        app = self._make_app(reading=True, paused=False, sentence_idx=0)
+        app._apply_speed_change()
+        self.assertEqual(app._sentence_idx, 0)
+        app._read_next_sentence.assert_not_called()
+
+    def test_debounced_fire_no_restart_with_no_sentences(self):
+        app = self._make_app(reading=True, paused=False, sentence_idx=1,
+                             sentences=[])
+        app._apply_speed_change()
+        app._read_next_sentence.assert_not_called()
+
+    # -- _stop cancels the pending debounce -------------------------------
+
+    def test_stop_cancels_pending_speed_debounce(self):
+        app = self._make_app(reading=True, paused=False, sentence_idx=2,
+                             debounce_id="speed#7")
+        app._pdf = MagicMock()
+        app._tts = MagicMock()
+        app._pending_after_id = None
+        app._save_bookmark = MagicMock()
+        app._clear_highlight = MagicMock()
+        app._play_btn = MagicMock()
+        app._pause_btn = MagicMock()
+        app._stop_btn = MagicMock()
+        app._stop()
+        app.after_cancel.assert_called_once_with("speed#7")
+        self.assertIsNone(app._speed_debounce_id,
+                          "_stop must clear the pending speed debounce id")
+
+    # -- voice path unchanged ----------------------------------------------
+
+    def test_voice_change_does_not_schedule_restart(self):
+        """Voice changes stay deferred to the next sentence (user decision
+        2026-06-12 covered speed only)."""
+        app = self._make_app(reading=True, paused=False)
+        app._on_voice_change("Some Other Voice")
+        app.after.assert_not_called()
+        app._read_next_sentence.assert_not_called()
+
+    def test_paused_slider_tick_cancels_pending_debounce_without_reschedule(self):
+        """A slider tick arriving after the user paused must cancel any
+        still-pending restart and must NOT schedule a new one."""
+        app = self._make_app(reading=True, paused=True, debounce_id="old#0")
+        app._on_speed_change(1.5)
+        app.after_cancel.assert_called_once_with("old#0")
+        app.after.assert_not_called()
+        self.assertIsNone(app._speed_debounce_id)
+
+    # -- end-to-end restart through the REAL sentence pump ------------------
+    # (validation 2026-06-12: the tests above mock _read_next_sentence; these
+    # exercise the real pump to verify the restart speaks the right sentence
+    # at the new speed, and that the two possible GUI-thread orderings of the
+    # debounce callback vs a queued <<SentenceDone>> event are both benign.)
+
+    def _make_app_real_pump(self, sentence_idx=2, speed=1.5):
+        """App whose _read_next_sentence is REAL (only _tts/_voices mocked)."""
+        import src.app as app_mod
+        app = app_mod.DocumentReaderApp.__new__(app_mod.DocumentReaderApp)
+        app._sentences = ["s0", "s1", "s2"]
+        app._sentence_idx = sentence_idx
+        app._reading = True
+        app._paused = False
+        app._speed_debounce_id = None
+        app._speed_display = MagicMock()
+        app._speed_var = MagicMock()
+        app._speed_var.get.return_value = speed
+        app._voice_var = MagicMock()
+        app._voice_var.get.return_value = "Some Voice"
+        app._voices = MagicMock()      # find_by_display -> truthy mock voice
+        app._highlight_sentence = MagicMock()
+        app._tts = MagicMock()
+        app.after = MagicMock(return_value="after#1")
+        app.after_cancel = MagicMock()
+        return app
+
+    def test_restart_respeaks_current_sentence_at_new_speed(self):
+        """The restart must re-speak the IN-FLIGHT sentence (idx-1, per the
+        ISSUE-007 post-increment) with the new slider value."""
+        app = self._make_app_real_pump(sentence_idx=2, speed=1.75)
+        app._apply_speed_change()
+        app._tts.speak.assert_called_once()
+        args, _kwargs = app._tts.speak.call_args
+        self.assertEqual(args[0], "s1", "restart spoke the wrong sentence")
+        self.assertEqual(args[2], 1.75, "restart did not use the new speed")
+        self.assertEqual(app._sentence_idx, 2,
+                         "rewind + post-increment must leave idx unchanged net")
+
+    def test_restart_then_stale_done_continues_with_following_sentence(self):
+        """GUI-thread ordering 1: the old utterance's done event was queued
+        BEFORE the debounce fired and is processed AFTER the restart.  It
+        must continue with the FOLLOWING sentence — no skip, no
+        double-advance, no second rewind."""
+        app = self._make_app_real_pump(sentence_idx=2)
+        app._apply_speed_change()        # restart re-speaks s1, idx back to 2
+        app._on_sentence_done_event()    # queued done of the original s1
+        spoken = [c[0][0] for c in app._tts.speak.call_args_list]
+        self.assertEqual(spoken, ["s1", "s2"],
+                         "stale done after a restart must continue with s2")
+        self.assertEqual(app._sentence_idx, 3)
+
+    def test_done_then_restart_respeaks_just_started_sentence(self):
+        """GUI-thread ordering 2: the done event runs first (pump starts s2),
+        then the debounce fires and re-speaks the just-started s2 at the new
+        speed.  Nothing is skipped and the index does not drift."""
+        app = self._make_app_real_pump(sentence_idx=2)
+        app._on_sentence_done_event()    # s1 finished -> pump speaks s2, idx=3
+        app._apply_speed_change()        # restart re-speaks s2 at new speed
+        spoken = [c[0][0] for c in app._tts.speak.call_args_list]
+        self.assertEqual(spoken, ["s2", "s2"],
+                         "done-then-restart must re-speak the just-started sentence")
+        self.assertEqual(app._sentence_idx, 3)
 
 
 # ---------------------------------------------------------------------------
@@ -1830,6 +2035,7 @@ class TestIssue031OnlineResumeReadvance(unittest.TestCase):
         app._highlight_sentence = MagicMock()
         app._clear_highlight = MagicMock()
         app._pending_after_id = None
+        app._speed_debounce_id = None   # ISSUE-016: cleared by _stop
         return app
 
     def test_play_source_readvances_index_on_resume(self):

@@ -38,6 +38,12 @@ class DocumentReaderApp(ctk.CTk):
         self._pending_after_id = None
         self._current_pdf_path: str | None = None
 
+        # ISSUE-016 fix: debounce timer id for applying speed changes
+        # mid-sentence.  Kept separate from _pending_after_id (which belongs
+        # to the sentence pump's page-done scheduling) so the two can never
+        # cancel each other's callbacks.
+        self._speed_debounce_id = None
+
         # ISSUE-003 fix: used by _on_sentence_done (background thread) to
         # marshal "sentence done" notifications safely to the GUI thread via
         # event_generate, which is the only thread-safe Tk call from non-GUI
@@ -369,6 +375,11 @@ class DocumentReaderApp(ctk.CTk):
         if self._pending_after_id is not None:
             self.after_cancel(self._pending_after_id)
             self._pending_after_id = None
+        # ISSUE-016 fix: a debounced speed-change restart must never fire
+        # after Stop (its guard would catch it anyway, but cancel eagerly).
+        if self._speed_debounce_id is not None:
+            self.after_cancel(self._speed_debounce_id)
+            self._speed_debounce_id = None
         self._tts.stop()
         self._sentence_idx = 0
         self._clear_highlight()
@@ -489,6 +500,46 @@ class DocumentReaderApp(ctk.CTk):
 
     def _on_speed_change(self, value):
         self._speed_display.configure(text=f"{value:.1f}x")
+        # ISSUE-016 fix: speed changes apply IMMEDIATELY during playback by
+        # re-speaking the current sentence at the new speed (user decision
+        # 2026-06-12; voice changes stay deferred to the next sentence by
+        # design).  The slider fires this callback continuously while
+        # dragging, so debounce: every tick cancels the previous timer and
+        # only the final settled value triggers a single restart.
+        if self._speed_debounce_id is not None:
+            self.after_cancel(self._speed_debounce_id)
+            self._speed_debounce_id = None
+        if self._reading and not self._paused:
+            self._speed_debounce_id = self.after(300, self._apply_speed_change)
+
+    def _apply_speed_change(self):
+        # ISSUE-016 fix: debounced restart of the current sentence at the new
+        # speed.  Runs on the GUI thread (after-callback).  Re-check state at
+        # FIRE time, not schedule time — the user may have paused or stopped
+        # during the debounce window.  While paused no restart is needed
+        # (resume / the next sentence read the slider naturally), and _stop
+        # cancels this timer anyway (belt and braces).
+        self._speed_debounce_id = None
+        if not self._reading or self._paused:
+            log.debug("Speed-change restart skipped (reading=%s, paused=%s)",
+                      self._reading, self._paused)
+            return
+        if self._sentence_idx <= 0 or not self._sentences:
+            return
+        # ISSUE-007: _read_next_sentence post-increments, so the in-flight
+        # sentence is _sentences[_sentence_idx - 1]; rewind one and re-speak
+        # it.  speak() internally stops the current utterance for both
+        # backends (generation bump ISSUE-017 suppresses the stale on_done;
+        # the started-word interrupt flag ISSUE-018 halts offline pyttsx3).
+        # If the sentence's natural done event is already queued, both
+        # callbacks serialize on the GUI thread: done-then-restart re-speaks
+        # the sentence that just started at the new speed (correct), while
+        # restart-then-stale-done merely cuts the repeated audio short and
+        # continues with the following sentence — no skip, no double rewind.
+        self._sentence_idx -= 1
+        log.info("Speed changed to %.2fx mid-sentence; restarting sentence idx=%d",
+                 self._speed_var.get(), self._sentence_idx)
+        self._read_next_sentence()
 
     def _set_status(self, msg: str):
         self._status_label.configure(text=msg)
