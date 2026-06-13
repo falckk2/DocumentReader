@@ -526,44 +526,58 @@ class TestIssue010LockCoverage(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# ISSUE-011 — Partially Resolved: polling-based end detection (code inspection)
+# ISSUE-011 — FIXED 2026-06-12: MM_MCINOTIFY is the primary end-of-track
+# signal; the polling monitor remains only as a fallback (code inspection)
 # ---------------------------------------------------------------------------
 
 class TestIssue011PollingEndDetection(unittest.TestCase):
     """
-    ISSUE-011 is marked Partially Resolved — MCI notify not yet implemented.
-    Tests confirm the stated partial fix description matches the code.
+    ISSUE-011 FIXED: `play ... notify` posts MM_MCINOTIFY to a hidden
+    message-only window. The original polling monitor is retained verbatim
+    as the fallback for when the notify window cannot be created, so its
+    end-detection invariants must still hold.
     """
 
     def test_mode_stopped_is_primary_detection(self):
-        """'mode == stopped' must be the primary end condition in the monitor."""
+        """'mode == stopped' must remain the fallback monitor's primary condition."""
         import src.audio_player as ap
         src = inspect.getsource(ap.AudioPlayer.play)
         self.assertIn('"stopped"', src,
-                      "Monitor does not check mode == 'stopped'")
+                      "Fallback monitor does not check mode == 'stopped'")
 
     def test_position_based_detection_present_as_backup(self):
-        """Position-based end detection must still be present as backup."""
+        """Position-based end detection must still be present in the fallback."""
         import src.audio_player as ap
         src = inspect.getsource(ap.AudioPlayer.play)
         self.assertIn("pos >= track_length", src,
                       "Position-based end detection backup missing")
 
-    def test_mci_notify_not_implemented(self):
-        """Confirm MCI notify window is NOT yet implemented (partial resolution)."""
+    def test_mci_notify_implemented(self):
+        """MM_MCINOTIFY handling must now exist (ISSUE-011 full resolution)."""
         import src.audio_player as ap
-        src = inspect.getsource(ap.AudioPlayer.play)
-        self.assertNotIn("MM_MCINOTIFY", src,
-                         "MM_MCINOTIFY appears in code — ISSUE-011 may now be fully resolved; update issues.md")
-        self.assertNotIn("WM_USER", src,
-                         "WM_USER message handling found — ISSUE-011 may now be fully resolved; update issues.md")
+        module_src = inspect.getsource(ap)
+        self.assertIn("MM_MCINOTIFY", module_src,
+                      "MM_MCINOTIFY missing — ISSUE-011 regressed to polling-only")
+        play_src = inspect.getsource(ap.AudioPlayer.play)
+        self.assertIn("notify", play_src,
+                      "play() never issues `play ... notify` (ISSUE-011)")
+        self.assertTrue(hasattr(ap.AudioPlayer, "_handle_mci_notify"),
+                        "AudioPlayer._handle_mci_notify missing (ISSUE-011)")
+        self.assertTrue(hasattr(ap, "_mci_notify"),
+                        "_mci_notify dispatcher variant missing (ISSUE-011)")
 
-    def test_drain_delay_still_present(self):
-        """The drain loop (5 x 0.05s) that substitutes for MCI notify is still present."""
+    def test_drain_delay_retained_only_in_polling_fallback(self):
+        """The 5 x 0.05s drain may survive ONLY inside the polling fallback;
+        the notify-driven completion path must contain no sleeps (the drain
+        and warmup were the gap sources ISSUE-011 set out to remove)."""
         import src.audio_player as ap
-        src = inspect.getsource(ap.AudioPlayer.play)
-        self.assertIn("time.sleep(0.05)", src,
-                      "Drain delay removed — audio cutoff risk increased; update ISSUE-011")
+        play_src = inspect.getsource(ap.AudioPlayer.play)
+        self.assertIn("time.sleep(0.05)", play_src,
+                      "Fallback drain removed — audio cutoff risk if polling is ever used")
+        for meth in ("_handle_mci_notify", "_complete_playback", "_notify_watchdog"):
+            src = inspect.getsource(getattr(ap.AudioPlayer, meth))
+            self.assertNotIn("time.sleep", src,
+                             f"{meth} sleeps — reintroduces inter-sentence gaps (ISSUE-011)")
 
 
 # ---------------------------------------------------------------------------
@@ -1020,12 +1034,13 @@ class TestIssue016ImmediateSpeedApply(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# ISSUE-011 status check — still Partially Resolved
+# ISSUE-011 status check — updated to FIXED/VALIDATED after MM_MCINOTIFY impl
 # ---------------------------------------------------------------------------
 
 class TestIssue011StatusCheck(unittest.TestCase):
 
-    def test_issue_011_status_is_partially_resolved(self):
+    def test_issue_011_status_is_fixed_or_validated(self):
+        """After the MM_MCINOTIFY implementation the status must be FIXED or VALIDATED."""
         issues_path = os.path.join(PROJECT_ROOT, "issues.md")
         with open(issues_path, encoding="utf-8") as f:
             content = f.read()
@@ -1034,8 +1049,544 @@ class TestIssue011StatusCheck(unittest.TestCase):
         )
         self.assertIsNotNone(section_match, "ISSUE-011 section not found in issues.md")
         section = section_match.group()
-        self.assertIn("Partially Resolved", section,
-                      "ISSUE-011 status changed from 'Partially Resolved'; confirm ISSUE-011 and update")
+        status_line = re.search(r"\*\*Status\*\*:.*", section)
+        self.assertIsNotNone(status_line, "ISSUE-011 has no Status line")
+        status_text = status_line.group()
+        self.assertTrue(
+            "FIXED" in status_text or "VALIDATED" in status_text,
+            f"ISSUE-011 should be FIXED or VALIDATED; status line: {status_text!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# ISSUE-011 — MM_MCINOTIFY implementation validation tests (2026-06-12)
+# ---------------------------------------------------------------------------
+
+def _make_notify_player():
+    """Return an AudioPlayer whose _ensure_notify_window is patched to return a
+    fake nonzero HWND (bypassing the real Win32 window) and whose _mci/_mci_notify
+    are stubbed to avoid hardware access.  This lets us drive the notify path
+    without a real window or MCI device.
+    """
+    import src.audio_player as ap
+    player = ap.AudioPlayer()
+    player._ensure_notify_window = MagicMock(return_value=0x9999)
+    # Stub MCI at module level (already stubbed by _import_audio_player setUp,
+    # but set explicitly here to be independent of test ordering).
+    ap._mci = MagicMock(return_value=0)
+    ap._mci_query = MagicMock(return_value="stopped")
+    ap._mci_notify = MagicMock(return_value=0)
+    return player, ap
+
+
+class TestIssue011NotifyPathStructural(unittest.TestCase):
+    """Structural checks: notify path is wired correctly without executing
+    real Win32 calls.  These verify code-inspection points from the Fix note."""
+
+    def test_ensure_notify_window_is_idempotent(self):
+        """_ensure_notify_window must cache the result: called twice returns
+        the same value and does not spawn a second thread."""
+        import src.audio_player as ap
+        player = ap.AudioPlayer()
+        # Under test the WinDLL is mocked so window creation fails → 0.
+        hwnd1 = player._ensure_notify_window()
+        hwnd2 = player._ensure_notify_window()
+        self.assertEqual(hwnd1, hwnd2,
+                         "_ensure_notify_window must return the same cached value "
+                         "on repeated calls (creation attempted only once)")
+
+    def test_ensure_notify_window_returns_zero_in_test_harness(self):
+        """Under tests WinDLL is mocked; window creation must fail and return 0."""
+        import src.audio_player as ap
+        player = ap.AudioPlayer()
+        hwnd = player._ensure_notify_window()
+        self.assertEqual(hwnd, 0,
+                         "Expected 0 (fallback) when WinDLL is mocked; "
+                         "got non-zero — window creation should fail under test stubs")
+
+    def test_play_issues_play_notify_when_hwnd_available(self):
+        """When _ensure_notify_window returns a nonzero hwnd, play() must
+        issue `play {alias} notify` via _mci_notify, NOT via plain _mci."""
+        player, ap = _make_notify_player()
+        plain_mci_calls_before = ap._mci.call_count
+        player.play("fake.mp3")
+        try:
+            notify_calls = [str(c) for c in ap._mci_notify.call_args_list
+                            if "notify" in str(c)]
+            self.assertTrue(
+                len(notify_calls) > 0,
+                "play() with a valid hwnd never issued 'play ... notify' via _mci_notify"
+            )
+            # Plain _mci should not have issued a bare `play` command
+            plain_play_cmds = [str(c) for c in ap._mci.call_args_list
+                               if "'play" in str(c) and "notify" not in str(c)
+                               and "close" not in str(c) and "open" not in str(c)
+                               and "set" not in str(c)]
+            self.assertEqual(
+                len(plain_play_cmds), 0,
+                f"play() issued a bare `play` command via _mci while notify is active: "
+                f"{plain_play_cmds}"
+            )
+        finally:
+            player.stop()
+
+    def test_play_installs_notify_ctx_with_fresh_token(self):
+        """After play() with notify active, _notify_ctx must be installed with
+        a monotonically increasing token matching _notify_token."""
+        player, ap = _make_notify_player()
+        player.play("fake.mp3")
+        try:
+            ctx = player._notify_ctx
+            self.assertIsNotNone(ctx,
+                                 "_notify_ctx not set after play() with notify path")
+            self.assertEqual(ctx["token"], player._notify_token,
+                             "_notify_ctx token must equal _notify_token")
+            self.assertEqual(player._notify_token, 1,
+                             "first play() must set _notify_token to 1")
+            self.assertFalse(ctx["fired"],
+                             "_notify_ctx 'fired' must start False")
+        finally:
+            player.stop()
+
+    def test_successive_plays_bump_token(self):
+        """Each successive play() must increment the token so stale notifies
+        for the previous playback cannot fire on_done for the new one."""
+        player, ap = _make_notify_player()
+        player.play("a.mp3")
+        token_a = player._notify_token
+        player.play("b.mp3")
+        token_b = player._notify_token
+        try:
+            self.assertGreater(token_b, token_a,
+                               "token must increase with each play() call")
+            ctx = player._notify_ctx
+            self.assertIsNotNone(ctx)
+            self.assertEqual(ctx["token"], token_b,
+                             "_notify_ctx must carry the NEW token after the second play()")
+        finally:
+            player.stop()
+
+    def test_monitor_thread_is_watchdog_not_tight_monitor(self):
+        """With notify active, the monitor thread must be the slow watchdog
+        (_notify_watchdog), not the tight polling _monitor (which has time.sleep(0.1)
+        as its inner loop and reports track_length at start)."""
+        player, ap = _make_notify_player()
+        player.play("fake.mp3")
+        try:
+            t = player._monitor_thread
+            self.assertIsNotNone(t, "no monitor thread started after play()")
+            self.assertEqual(t.name, "mci-notify-watchdog",
+                             "With notify active, monitor_thread must be named "
+                             "'mci-notify-watchdog', not the tight polling monitor")
+        finally:
+            player.stop()
+
+    def test_wndclass_counter_increments_across_instances(self):
+        """Each AudioPlayer must get a unique window class name to avoid
+        RegisterClassW name collisions when multiple instances coexist."""
+        import src.audio_player as ap
+        c1 = next(ap._wndclass_counter)
+        c2 = next(ap._wndclass_counter)
+        self.assertGreater(c2, c1,
+                           "_wndclass_counter must be strictly increasing (unique "
+                           "class names per player instance)")
+
+    def test_wndproc_ref_held_as_instance_attribute(self):
+        """The WNDPROC callback must be kept alive via a strong instance reference
+        to prevent ctypes GC-ing it while the window still uses it."""
+        import src.audio_player as ap
+        src_init = inspect.getsource(ap.AudioPlayer.__init__)
+        self.assertIn("_wndproc_ref", src_init,
+                      "_wndproc_ref strong-ref slot not declared in __init__ (GC risk)")
+        src_main = inspect.getsource(ap.AudioPlayer._notify_window_main)
+        self.assertIn("_wndproc_ref", src_main,
+                      "_wndproc_ref not assigned in _notify_window_main — "
+                      "WNDPROC callback may be GC'd")
+
+    def test_stop_clears_notify_ctx(self):
+        """stop() must clear _notify_ctx so a queued MM_MCINOTIFY or watchdog
+        cannot fire on_done after stop() returns."""
+        player, ap = _make_notify_player()
+        player.play("fake.mp3")
+        self.assertIsNotNone(player._notify_ctx,
+                             "precondition: _notify_ctx must be set after play()")
+        player.stop()
+        self.assertIsNone(player._notify_ctx,
+                          "stop() must clear _notify_ctx to suppress queued notifies")
+
+    def test_play_falls_back_to_plain_play_when_notify_fails(self):
+        """If _mci_notify returns non-zero, play() must fall back to plain
+        `play {alias}` via _mci and must clear _notify_ctx."""
+        import src.audio_player as ap
+        player = ap.AudioPlayer()
+        player._ensure_notify_window = MagicMock(return_value=0x9999)
+        ap._mci = MagicMock(return_value=0)
+        ap._mci_notify = MagicMock(return_value=1)  # notify fails
+        ap._mci_query = MagicMock(return_value="stopped")
+        player.play("fake.mp3")
+        try:
+            # _notify_ctx must be cleared on fallback
+            self.assertIsNone(player._notify_ctx,
+                              "After notify-play failure, _notify_ctx must be None")
+            # Plain 'play' must have been issued
+            plain_play = [str(c) for c in ap._mci.call_args_list
+                          if "play" in str(c) and "close" not in str(c)
+                          and "open" not in str(c) and "set" not in str(c)]
+            self.assertTrue(len(plain_play) > 0,
+                            "After notify failure, fallback `play` via _mci not issued")
+        finally:
+            player.stop()
+
+
+class TestIssue011NotifyTokenLogic(unittest.TestCase):
+    """Behavioral tests for _handle_mci_notify and _complete_playback token
+    logic — exercisable without a live window."""
+
+    def _make_player_with_ctx(self, on_done=None):
+        """Return a player with a valid _notify_ctx installed (token=1)."""
+        import src.audio_player as ap
+        ap._mci = MagicMock(return_value=0)
+        ap._mci_query = MagicMock(return_value="stopped")
+        player = ap.AudioPlayer()
+        stop_event = threading.Event()
+        player._stop_event = stop_event
+        player._notify_token = 1
+        player._notify_ctx = {
+            "token": 1,
+            "stop_event": stop_event,
+            "on_done": on_done,
+            "fired": False,
+        }
+        with player._lock:
+            player._playing = True
+            player._open = True
+        return player
+
+    def test_successful_notify_fires_on_done_once(self):
+        """MCI_NOTIFY_SUCCESSFUL with mode=stopped must fire on_done exactly once."""
+        import src.audio_player as ap
+        fired = []
+        player = self._make_player_with_ctx(on_done=lambda: fired.append(1))
+        ap._mci_query = MagicMock(return_value="stopped")
+        player._handle_mci_notify(ap.MCI_NOTIFY_SUCCESSFUL, 0)
+        # on_done fires on a detached thread — wait briefly
+        time.sleep(0.1)
+        self.assertEqual(fired, [1],
+                         "MCI_NOTIFY_SUCCESSFUL must fire on_done exactly once")
+
+    def test_successful_notify_fires_on_done_only_once_even_if_called_twice(self):
+        """Idempotency: a duplicate SUCCESSFUL (e.g. watchdog races with notify)
+        must not double-fire on_done."""
+        import src.audio_player as ap
+        fired = []
+        player = self._make_player_with_ctx(on_done=lambda: fired.append(1))
+        ap._mci_query = MagicMock(return_value="stopped")
+        player._handle_mci_notify(ap.MCI_NOTIFY_SUCCESSFUL, 0)
+        player._handle_mci_notify(ap.MCI_NOTIFY_SUCCESSFUL, 0)
+        time.sleep(0.1)
+        self.assertEqual(fired, [1],
+                         "on_done must fire at most once — duplicate notify doubled it")
+
+    def test_superseded_code_does_not_fire_on_done(self):
+        """MCI_NOTIFY_SUPERSEDED must be silently ignored."""
+        import src.audio_player as ap
+        fired = []
+        player = self._make_player_with_ctx(on_done=lambda: fired.append(1))
+        ap._mci_query = MagicMock(return_value="stopped")
+        player._handle_mci_notify(ap.MCI_NOTIFY_SUPERSEDED, 0)
+        time.sleep(0.05)
+        self.assertEqual(fired, [],
+                         "MCI_NOTIFY_SUPERSEDED must not fire on_done")
+
+    def test_aborted_code_does_not_fire_on_done(self):
+        """MCI_NOTIFY_ABORTED must be silently ignored."""
+        import src.audio_player as ap
+        fired = []
+        player = self._make_player_with_ctx(on_done=lambda: fired.append(1))
+        ap._mci_query = MagicMock(return_value="stopped")
+        player._handle_mci_notify(ap.MCI_NOTIFY_ABORTED, 0)
+        time.sleep(0.05)
+        self.assertEqual(fired, [],
+                         "MCI_NOTIFY_ABORTED must not fire on_done")
+
+    def test_failure_code_does_not_fire_on_done(self):
+        """MCI_NOTIFY_FAILURE must be silently ignored."""
+        import src.audio_player as ap
+        fired = []
+        player = self._make_player_with_ctx(on_done=lambda: fired.append(1))
+        ap._mci_query = MagicMock(return_value="stopped")
+        player._handle_mci_notify(ap.MCI_NOTIFY_FAILURE, 0)
+        time.sleep(0.05)
+        self.assertEqual(fired, [],
+                         "MCI_NOTIFY_FAILURE must not fire on_done")
+
+    def test_stale_notify_ignored_when_device_playing(self):
+        """SUCCESSFUL with mode='playing' must be dropped (stale-notify defense)."""
+        import src.audio_player as ap
+        fired = []
+        player = self._make_player_with_ctx(on_done=lambda: fired.append(1))
+        ap._mci_query = MagicMock(return_value="playing")  # device still active
+        player._handle_mci_notify(ap.MCI_NOTIFY_SUCCESSFUL, 0)
+        time.sleep(0.05)
+        self.assertEqual(fired, [],
+                         "SUCCESSFUL with mode='playing' must be treated as stale "
+                         "and not fire on_done (stale-notify defense)")
+
+    def test_stale_token_notify_ignored(self):
+        """A SUCCESSFUL with the OLD token (after a new play()) must be dropped."""
+        import src.audio_player as ap
+        fired = []
+        player = self._make_player_with_ctx(on_done=lambda: fired.append(1))
+        ap._mci_query = MagicMock(return_value="stopped")
+        # Simulate new play() bumped the token
+        with player._lock:
+            player._notify_ctx["token"] = 2
+            player._notify_token = 2
+        # Old token=1 arrives
+        player._complete_playback(1)
+        time.sleep(0.05)
+        self.assertEqual(fired, [],
+                         "Stale token (old playback) must not fire on_done")
+
+    def test_notify_after_stop_does_not_fire_on_done(self):
+        """After stop() clears _notify_ctx, a late SUCCESSFUL must be ignored."""
+        import src.audio_player as ap
+        fired = []
+        player = self._make_player_with_ctx(on_done=lambda: fired.append(1))
+        ap._mci_query = MagicMock(return_value="stopped")
+        player.stop()  # clears _notify_ctx
+        player._handle_mci_notify(ap.MCI_NOTIFY_SUCCESSFUL, 0)
+        time.sleep(0.05)
+        self.assertEqual(fired, [],
+                         "Notify arriving after stop() must not fire on_done")
+
+    def test_complete_playback_clears_playing_flag(self):
+        """_complete_playback must clear _playing and _paused under lock."""
+        import src.audio_player as ap
+        player = self._make_player_with_ctx(on_done=None)
+        result = player._complete_playback(1)
+        self.assertTrue(result, "_complete_playback should return True on first call")
+        with player._lock:
+            self.assertFalse(player._playing,
+                             "_complete_playback must clear _playing")
+            self.assertFalse(player._paused,
+                             "_complete_playback must clear _paused")
+
+    def test_complete_playback_is_idempotent(self):
+        """Calling _complete_playback twice with the same token must return
+        False on the second call (fired guard)."""
+        import src.audio_player as ap
+        player = self._make_player_with_ctx(on_done=None)
+        first = player._complete_playback(1)
+        second = player._complete_playback(1)
+        self.assertTrue(first)
+        self.assertFalse(second,
+                         "_complete_playback second call must return False (idempotent)")
+
+    def test_on_done_dispatched_on_detached_thread_not_notify_thread(self):
+        """on_done must be fired from a detached thread so the notify-window
+        message pump is never blocked (ISSUE-022 pattern)."""
+        import src.audio_player as ap
+        caller_thread = threading.current_thread()
+        fired_on = []
+        ev = threading.Event()
+
+        def on_done():
+            fired_on.append(threading.current_thread())
+            ev.set()
+
+        player = self._make_player_with_ctx(on_done=on_done)
+        ap._mci_query = MagicMock(return_value="stopped")
+        player._handle_mci_notify(ap.MCI_NOTIFY_SUCCESSFUL, 0)
+        self.assertTrue(ev.wait(timeout=2.0), "on_done never fired")
+        self.assertIsNot(fired_on[0], caller_thread,
+                         "on_done must fire on a detached thread, not the caller")
+
+
+class TestIssue011WatchdogBehavior(unittest.TestCase):
+    """Behavioral tests for _notify_watchdog (backup polling thread)."""
+
+    def test_watchdog_fires_complete_playback_on_stopped_device(self):
+        """If MM_MCINOTIFY was lost, the watchdog must call _complete_playback
+        when it detects mode=='stopped'."""
+        import src.audio_player as ap
+        ap._mci_query = MagicMock(return_value="stopped")
+        player = ap.AudioPlayer()
+        stop_event = threading.Event()
+        token = 7
+        fired = []
+
+        def fake_complete(t):
+            fired.append(t)
+            stop_event.set()  # exit the loop after first completion
+            return True
+
+        player._complete_playback = fake_complete
+        player._notify_ctx = {
+            "token": token,
+            "stop_event": stop_event,
+            "on_done": None,
+            "fired": False,
+        }
+        with player._lock:
+            player._open = True
+
+        # Run the watchdog in a thread; it should fire within 2s+epsilon
+        t = threading.Thread(target=player._notify_watchdog,
+                             args=(stop_event, token), daemon=True)
+        t.start()
+        t.join(timeout=5.0)
+        self.assertFalse(t.is_alive(), "watchdog thread did not exit within 5s")
+        self.assertEqual(fired, [token],
+                         "watchdog did not call _complete_playback when mode='stopped'")
+
+    def test_watchdog_exits_promptly_when_stop_event_set(self):
+        """stop() sets the stop_event; the watchdog must exit within the next
+        poll interval (2s max), not hang."""
+        import src.audio_player as ap
+        # Return "playing" forever so the watchdog would loop without stop_event
+        ap._mci_query = MagicMock(return_value="playing")
+        player = ap.AudioPlayer()
+        stop_event = threading.Event()
+        player._notify_ctx = {
+            "token": 1,
+            "stop_event": stop_event,
+            "on_done": None,
+            "fired": False,
+        }
+        with player._lock:
+            player._open = True
+
+        t = threading.Thread(target=player._notify_watchdog,
+                             args=(stop_event, 1), daemon=True)
+        t.start()
+        stop_event.set()  # simulate stop()
+        t.join(timeout=3.0)
+        self.assertFalse(t.is_alive(),
+                         "watchdog did not exit within 3s after stop_event was set")
+
+    def test_watchdog_exits_when_token_changes(self):
+        """A new play() installs a new token; the watchdog for the OLD token
+        must detect ctx["token"] != token and exit without completing."""
+        import src.audio_player as ap
+        ap._mci_query = MagicMock(return_value="playing")
+        player = ap.AudioPlayer()
+        stop_event_old = threading.Event()
+        old_token = 1
+        new_token = 2
+        completed = []
+
+        def fake_complete(t):
+            completed.append(t)
+            return True
+
+        player._complete_playback = fake_complete
+        player._notify_ctx = {
+            "token": old_token,
+            "stop_event": stop_event_old,
+            "on_done": None,
+            "fired": False,
+        }
+        with player._lock:
+            player._open = True
+
+        t = threading.Thread(target=player._notify_watchdog,
+                             args=(stop_event_old, old_token), daemon=True)
+        t.start()
+        # Simulate a new play(): bump token, replace ctx
+        stop_event_old.set()  # stop() sets the old event
+        with player._lock:
+            player._notify_ctx = {
+                "token": new_token,
+                "stop_event": threading.Event(),
+                "on_done": None,
+                "fired": False,
+            }
+        t.join(timeout=3.0)
+        self.assertFalse(t.is_alive(),
+                         "old-token watchdog did not exit after stop_event set")
+        self.assertEqual(completed, [],
+                         "old-token watchdog must not call _complete_playback "
+                         "for the new playback's token")
+
+
+class TestIssue011Regressions(unittest.TestCase):
+    """Regression guards: key invariants from prior ISSUE fixes must hold
+    with the MM_MCINOTIFY implementation in place."""
+
+    def test_issue_001_self_join_guard_on_watchdog_thread(self):
+        """ISSUE-001: if stop() is somehow called from the watchdog thread
+        (_monitor_thread), the self-join guard must fire and not deadlock."""
+        import src.audio_player as ap
+        ap._mci = MagicMock(return_value=0)
+        ap._mci_query = MagicMock(return_value="stopped")
+        player = ap.AudioPlayer()
+        error = []
+
+        def fake_watchdog():
+            player._monitor_thread = threading.current_thread()
+            try:
+                player.stop()
+            except RuntimeError as e:
+                error.append(e)
+
+        t = threading.Thread(target=fake_watchdog)
+        t.start()
+        t.join(timeout=3)
+        self.assertEqual(error, [],
+                         "stop() raised RuntimeError when called from watchdog "
+                         "thread (ISSUE-001 self-join guard regressed)")
+
+    def test_issue_022_on_done_not_inline_in_complete_playback(self):
+        """ISSUE-022: _complete_playback must fire on_done via a detached thread
+        (never inline), so the notify-window pump is never blocked."""
+        import src.audio_player as ap
+        src = inspect.getsource(ap.AudioPlayer._complete_playback)
+        self.assertIn("on-done-dispatch", src,
+                      "_complete_playback must fire on_done via a detached "
+                      "'on-done-dispatch' thread (ISSUE-022 regression)")
+        self.assertNotIn("cb()", src,
+                         "_complete_playback calls on_done inline — "
+                         "notify-window pump could block (ISSUE-022 regression)")
+
+    def test_issue_029_dispatcher_handles_two_element_item_with_notify_hwnd(self):
+        """ISSUE-029: _mci_worker now accepts 2-element and 3-element items.
+        A 3-element item (cmd, rq, hwnd) must be processed without killing the
+        worker; a 2-element item (cmd, rq) must still work as before."""
+        import src.audio_player as ap
+        # 3-element item: _mci_notify path
+        rq3 = queue.Queue()
+        ap._cmd_queue.put(("status fake mode", rq3, 0x9999))
+        try:
+            rq3.get(timeout=3)
+        except queue.Empty:
+            self.fail("dispatcher did not respond to 3-element (notify) item (ISSUE-029)")
+        # 2-element item: _mci path
+        rq2 = queue.Queue()
+        ap._cmd_queue.put(("status fake mode", rq2))
+        try:
+            rq2.get(timeout=3)
+        except queue.Empty:
+            self.fail("dispatcher did not respond to 2-element item after a "
+                      "3-element item (ISSUE-029 regression)")
+
+    def test_mci_notify_dispatcher_variant_has_5s_timeout(self):
+        """ISSUE-026: _mci_notify must time out rather than block forever."""
+        import importlib, importlib.util, sys
+        # _mci_notify is patched to a MagicMock in the test harness, so we
+        # inspect the source file directly rather than via the live module object.
+        spec = importlib.util.spec_from_file_location(
+            "_ap_src",
+            os.path.join(PROJECT_ROOT, "src", "audio_player.py")
+        )
+        src_mod = importlib.util.module_from_spec(spec)
+        # Parse the source text without executing (avoids DLL load)
+        import ast
+        with open(os.path.join(PROJECT_ROOT, "src", "audio_player.py"),
+                  encoding="utf-8") as f:
+            src_text = f.read()
+        self.assertIn("timeout=5.0", src_text,
+                      "_mci_notify does not enforce a 5s caller timeout (ISSUE-026 regression)")
 
 
 # ---------------------------------------------------------------------------

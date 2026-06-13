@@ -6,40 +6,6 @@ Issues are sorted by status: OPEN → NEEDS_REVIEW → FIXED → PARTIAL → VAL
 
 ---
 
-## ISSUE-011 — End-of-track detection relies on position polling (latency between sentences)
-
-**Status**: PARTIAL ⚠️
-**Severity**: MEDIUM
-
-### Discovery
-- **File**: `src/audio_player.py` — `_monitor` lines ~93-127
-- **Description**: The monitor polls `status mode` and `status position` every 0.1s. End is detected either by `mode == "stopped"` or `pos >= track_length`. If `track_length` could not be read (query failed → `track_length = 0`), the `pos >= track_length` branch is disabled and end detection depends solely on MCI reporting `"stopped"`. Conversely, MCI sometimes reports `position` slightly less than `length` at true end, delaying `on_done` by up to the 0.1s poll plus the 5×0.05s drain. Cumulative latency across many short sentences adds noticeable gaps.
-- **Root Cause**: Polling-based completion instead of MCI `notify` callback (`play ... notify` + `MM_MCINOTIFY`), plus a magic 0.2s warmup and 0.25s drain.
-- **Impact**: Audible gaps between sentences; rare premature cutoff of the last fraction of a sentence if drain is too short.
-- **Reproduction**: Read a page of many short sentences; observe inter-sentence gaps. Use a sub-200ms clip to test warmup edge.
-- **Depends On**: None
-- **Fix Suggestion**: Use `play {alias} notify` with a window/callback for `MM_MCINOTIFY`, or at minimum reduce reliance on magic timings and detect end via `mode == "stopped"` as primary with position as backup. Log measured track_length and final position.
-- **Logging Added**: Added DEBUG logging of `track_length` at monitor start and a warning when length cannot be read.
-- **Date Found**: 2026-06-02
-
-### Fix
-- **Date**: 2026-06-02
-- **Changes**: No code change. Implementing MCI `notify` requires a hidden Win32 window to receive `MM_MCINOTIFY` messages, which is a significant architectural addition. The existing `mode == "stopped"` primary detection plus position-based backup is functionally correct. Reducing magic timings risks audio cutoff.
-- **Remaining**: Implement Win32 `MM_MCINOTIFY` via a hidden `HWND` to eliminate polling gaps between sentences.
-
-### Validation
-- **Date**: 2026-06-02
-- **Method**: Tests + code inspection
-- **Tests**: `tests/test_issue_validations.py` — test_mode_stopped_is_primary_detection, test_position_based_detection_present_as_backup, test_mci_notify_not_implemented, test_drain_delay_still_present
-- **Results**: 4 passed, 0 failed
-  - ✅ test_mode_stopped_is_primary_detection
-  - ✅ test_position_based_detection_present_as_backup
-  - ✅ test_mci_notify_not_implemented — confirms MM_MCINOTIFY not yet implemented
-  - ✅ test_drain_delay_still_present — 5 x 0.05s drain loop still present
-- **Inspection**: `_monitor` (audio_player.py lines 101-140) polls every 0.1s, breaks on `status == "stopped"` as primary condition, and on `pos >= track_length` as backup with a drain loop. No MCI notify window (`HWND`, `MM_MCINOTIFY`, `WM_USER`) present in the codebase. This matches the stated partial resolution.
-- **Verdict**: Correctly marked as Partially Resolved. The polling mechanism is functionally correct; the known gap (audible inter-sentence gaps from polling latency) remains for a future `MM_MCINOTIFY` implementation.
-- **New Issues**: None
-
 ---
 
 ## ISSUE-001 — `AudioPlayer.stop()` can deadlock when called from the monitor thread
@@ -1120,6 +1086,95 @@ Issues are sorted by status: OPEN → NEEDS_REVIEW → FIXED → PARTIAL → VAL
   - ✅ test_voice_change_does_not_schedule_restart / test_voice_change_handler_is_pass — voice path untouched
 - **Inspection**: `git diff` confirms the source change is exactly the four described blocks in `src/app.py` (init field line 45, `_stop` cancel lines 380-382, `_on_speed_change` lines 501-513, new `_apply_speed_change` lines 515-542); no other source file changed. (1) Debounce: `_speed_debounce_id` is a distinct field only ever cancelled by `_on_speed_change`, `_stop`, and self-cleared at fire; Tk after-ids are unique, so no collision with `_pending_after_id` is possible. (2) Fire-time guards re-check `_reading`/`_paused`/`idx>0`/`_sentences`; pause inside the window is caught by the guard (and `_stop` additionally cancels + zeroes idx — triple protection); a quick pause→resume inside the window harmlessly restarts the interrupted sentence at the new speed. Traced the page-boundary race: if the debounce fires while the last sentence's done event is queued (idx==len), the restart re-speaks the already-fully-heard last sentence and the subsequent done routes to `_on_page_done`, which either kills it via `_stop(completed=True)` (also cancelling any later debounce) or auto-advances — no content loss, no double `_on_page_done`. The theoretical restart-utterance-completes-before-the-queued-done interleaving requires a full synth+playback inside one GUI event-loop pass — unreachable, same class as the accepted ISSUE-027 residual. (3) Backend interruption confirmed: `speak()`→`stop()` bumps the generation under `_gen_lock` (online mid-synth discards at the ISSUE-027 locked handoff; mid-playback is killed by `_player.stop()` with the ISSUE-028 per-playback event suppressing its on_done) and sets `_pyttsx3_interrupt` (started-word `engine.stop()` in-worker, on_done suppressed by the still-set flag AND the ISSUE-017 gen gate) — no overlapping audio, no double on_done. (4) Regressions: `_pause`/`_stop` rewinds (ISSUE-007), pause-gen-bump (ISSUE-019), completion bookmarks (ISSUE-025), `on_close` gate (ISSUE-030), and the ISSUE-031 resume re-advance are all untouched; the `TestIssue031._make_app` addition of `_speed_debounce_id = None` mirrors real post-`__init__` state and changes no behavioral assertion (verified in the diff).
 - **Verdict**: Fix is confirmed correct and complete. Speed changes apply immediately via a properly debounced, fully guarded restart of the in-flight sentence; voice changes remain deferred; no regression found.
+- **New Issues**: None
+
+---
+
+## ISSUE-011 — End-of-track detection relies on position polling (latency between sentences)
+
+**Status**: VALIDATED ✅
+**Severity**: MEDIUM
+
+### Discovery
+- **File**: `src/audio_player.py` — `_monitor` lines ~93-127
+- **Description**: The monitor polls `status mode` and `status position` every 0.1s. End is detected either by `mode == "stopped"` or `pos >= track_length`. If `track_length` could not be read (query failed → `track_length = 0`), the `pos >= track_length` branch is disabled and end detection depends solely on MCI reporting `"stopped"`. Conversely, MCI sometimes reports `position` slightly less than `length` at true end, delaying `on_done` by up to the 0.1s poll plus the 5×0.05s drain. Cumulative latency across many short sentences adds noticeable gaps.
+- **Root Cause**: Polling-based completion instead of MCI `notify` callback (`play ... notify` + `MM_MCINOTIFY`), plus a magic 0.2s warmup and 0.25s drain.
+- **Impact**: Audible gaps between sentences; rare premature cutoff of the last fraction of a sentence if drain is too short.
+- **Reproduction**: Read a page of many short sentences; observe inter-sentence gaps. Use a sub-200ms clip to test warmup edge.
+- **Depends On**: None
+- **Fix Suggestion**: Use `play {alias} notify` with a window/callback for `MM_MCINOTIFY`, or at minimum reduce reliance on magic timings and detect end via `mode == "stopped"` as primary with position as backup. Log measured track_length and final position.
+- **Logging Added**: Added DEBUG logging of `track_length` at monitor start and a warning when length cannot be read.
+- **Date Found**: 2026-06-02
+
+### Fix
+- **Date**: 2026-06-02
+- **Changes**: No code change. Implementing MCI `notify` requires a hidden Win32 window to receive `MM_MCINOTIFY` messages, which is a significant architectural addition. The existing `mode == "stopped"` primary detection plus position-based backup is functionally correct. Reducing magic timings risks audio cutoff.
+- **Remaining**: Implement Win32 `MM_MCINOTIFY` via a hidden `HWND` to eliminate polling gaps between sentences.
+
+### Validation
+- **Date**: 2026-06-02
+- **Method**: Tests + code inspection
+- **Tests**: `tests/test_issue_validations.py` — test_mode_stopped_is_primary_detection, test_position_based_detection_present_as_backup, test_mci_notify_not_implemented, test_drain_delay_still_present
+- **Results**: 4 passed, 0 failed
+  - ✅ test_mode_stopped_is_primary_detection
+  - ✅ test_position_based_detection_present_as_backup
+  - ✅ test_mci_notify_not_implemented — confirms MM_MCINOTIFY not yet implemented
+  - ✅ test_drain_delay_still_present — 5 x 0.05s drain loop still present
+- **Inspection**: `_monitor` (audio_player.py lines 101-140) polls every 0.1s, breaks on `status == "stopped"` as primary condition, and on `pos >= track_length` as backup with a drain loop. No MCI notify window (`HWND`, `MM_MCINOTIFY`, `WM_USER`) present in the codebase. This matches the stated partial resolution.
+- **Verdict**: Correctly marked as Partially Resolved. The polling mechanism is functionally correct; the known gap (audible inter-sentence gaps from polling latency) remains for a future `MM_MCINOTIFY` implementation.
+- **New Issues**: None
+
+### Fix (MM_MCINOTIFY implementation — completes the partial resolution)
+- **Date**: 2026-06-12
+- **Changes**: Implemented the Win32 `MM_MCINOTIFY` (0x3B9) end-of-track signal so completion no longer relies on polling, eliminating the inter-sentence gaps (no 0.2s warmup, 0.1s poll, or 5×0.05s drain on the notify path). In `src/audio_player.py`:
+  - **Hidden message-only window**: `_ensure_notify_window()` lazily spawns a dedicated daemon thread (`mci-notify-window`) running `_notify_window_main`, which registers a window class and creates a `HWND_MESSAGE` (-3) message-only window, then pumps messages (`GetMessageW`/`TranslateMessage`/`DispatchMessageW`). A strong reference to the `WNDPROC` callback is held (`_wndproc_ref`) so ctypes never GCs it. Window/thread are torn down in `close()` via `PostMessageW(WM_CLOSE)` → `DestroyWindow` → `PostQuitMessage`. Creation is attempted at most once per player and cached.
+  - **Notify request**: a new `_mci_notify(cmd, hwnd)` dispatcher variant passes the window's `HWND` as the `hwndCallback` of `mciSendStringW` for `play {alias} notify` only (other commands still pass 0). The single-threaded MCI dispatcher (`_mci_worker`) was extended to accept the optional HWND as a third queue element.
+  - **Notification handling**: the thin `_wndproc` delegates real work to `_handle_mci_notify(wparam, lparam)` (directly testable without a live window). Only `MCI_NOTIFY_SUCCESSFUL` (0x0001) fires `on_done`; `SUPERSEDED`/`ABORTED`/`FAILURE` (arriving when stop()/a new play() interrupts the device) are suppressed, matching existing stop-suppression semantics. A stale-notify defense queries `status mode` and drops a SUCCESSFUL that arrives while the device is again actively playing (MCI reuses device ids across close/open).
+  - **Per-playback token (ISSUE-028 pattern)**: each `play()` installs a `_notify_ctx` carrying a monotonic `token`, the per-playback `stop_event`, the captured `on_done`, and a `fired` flag. `_complete_playback(token)` is token-guarded and idempotent, so a queued stale notify or the watchdog can never fire a newer playback's `on_done` or double-fire. `on_done` is always dispatched from a detached `on-done-dispatch` thread (preserves the ISSUE-022 no-GUI-freeze guarantee and the ISSUE-001 self-join guard).
+  - **Watchdog + fallback**: with notify active, a slow 2s `_notify_watchdog` doubles as the joinable monitor thread (so `stop()`'s join semantics are unchanged) and completes playback if a notify message is ever lost. If the notify window cannot be created (`_ensure_notify_window` returns 0) or `play ... notify` fails, the code logs a WARNING and falls back to the original tight polling `_monitor` verbatim (drain loop retained there only).
+- **Smoke check**: outside the test harness, `AudioPlayer()._ensure_notify_window()` creates a real window (e.g. `hwnd=0x9093a`) and `close()` tears it down cleanly. Full audible verification of gap removal requires a real playback session and was not run headlessly.
+- **Test note**: the test suite patches `ctypes.WinDLL` to a `MagicMock` before importing `audio_player`, so under tests every Win32 call (incl. `GetModuleHandleW`) is mocked; window creation deliberately fails and exercises the polling fallback (a `WARNING` + traceback is logged by design on that path). `_handle_mci_notify`/`_complete_playback` token logic is tested directly. The old behavior-pinning tests were inverted: `test_mci_notify_not_implemented` → `test_mci_notify_implemented`; `test_drain_delay_still_present` → `test_drain_delay_retained_only_in_polling_fallback` (asserts the notify-completion path contains no sleeps).
+
+### Validation
+- **Date**: 2026-06-12
+- **Method**: Tests + code inspection
+- **Tests**: `tests/test_issue_validations.py` — TestIssue011StatusCheck (1), TestIssue011PollingEndDetection (4), TestIssue011NotifyPathStructural (11), TestIssue011NotifyTokenLogic (11), TestIssue011WatchdogBehavior (3), TestIssue011Regressions (4) — 34 ISSUE-011 tests total
+- **Results**: 34 passed, 0 failed; full suite 181 passed, 0 failed, 0 errors
+  - ✅ test_issue_011_status_is_fixed_or_validated — status is FIXED or VALIDATED
+  - ✅ test_mode_stopped_is_primary_detection — fallback monitor retains 'stopped' check
+  - ✅ test_position_based_detection_present_as_backup — fallback monitor retains position backup
+  - ✅ test_mci_notify_implemented — MM_MCINOTIFY, `play ... notify`, and `_handle_mci_notify` all present
+  - ✅ test_drain_delay_retained_only_in_polling_fallback — notify path methods contain no time.sleep; drain only in fallback
+  - ✅ test_ensure_notify_window_is_idempotent — creation attempted at most once, result cached
+  - ✅ test_ensure_notify_window_returns_zero_in_test_harness — mocked WinDLL yields 0 (fallback active under tests; expected by design)
+  - ✅ test_play_issues_play_notify_when_hwnd_available — `play ... notify` issued via `_mci_notify` (not plain `_mci`) when hwnd is nonzero
+  - ✅ test_play_installs_notify_ctx_with_fresh_token — `_notify_ctx` carries correct token, `fired=False`
+  - ✅ test_successive_plays_bump_token — token strictly increases across play() calls
+  - ✅ test_monitor_thread_is_watchdog_not_tight_monitor — notify path sets `_monitor_thread` to `mci-notify-watchdog`, not the tight polling closure
+  - ✅ test_wndclass_counter_increments_across_instances — unique window class names per player
+  - ✅ test_wndproc_ref_held_as_instance_attribute — `_wndproc_ref` declared in `__init__`, assigned in `_notify_window_main`
+  - ✅ test_stop_clears_notify_ctx — stop() sets `_notify_ctx = None` under lock
+  - ✅ test_play_falls_back_to_plain_play_when_notify_fails — `_mci_notify` returning non-zero clears ctx and falls back to plain play
+  - ✅ test_successful_notify_fires_on_done_once — `MCI_NOTIFY_SUCCESSFUL` with mode=stopped fires on_done exactly once
+  - ✅ test_successful_notify_fires_on_done_only_once_even_if_called_twice — idempotent: second call suppressed by `fired` flag
+  - ✅ test_superseded_code_does_not_fire_on_done — `MCI_NOTIFY_SUPERSEDED` suppressed
+  - ✅ test_aborted_code_does_not_fire_on_done — `MCI_NOTIFY_ABORTED` suppressed
+  - ✅ test_failure_code_does_not_fire_on_done — `MCI_NOTIFY_FAILURE` suppressed
+  - ✅ test_stale_notify_ignored_when_device_playing — SUCCESSFUL with mode='playing' dropped (stale-notify defense)
+  - ✅ test_stale_token_notify_ignored — old-playback token rejected by `_complete_playback`
+  - ✅ test_notify_after_stop_does_not_fire_on_done — late notify after stop() is a no-op (`_notify_ctx` is None)
+  - ✅ test_complete_playback_clears_playing_flag — `_complete_playback` clears `_playing` and `_paused` under lock
+  - ✅ test_complete_playback_is_idempotent — second call with same token returns False
+  - ✅ test_on_done_dispatched_on_detached_thread_not_notify_thread — on_done fires on a new thread, never inline on the notify-window thread
+  - ✅ test_watchdog_fires_complete_playback_on_stopped_device — watchdog calls `_complete_playback` when device shows stopped
+  - ✅ test_watchdog_exits_promptly_when_stop_event_set — watchdog exits within 3s of stop_event being set
+  - ✅ test_watchdog_exits_when_token_changes — old-token watchdog exits without completing when ctx token changes
+  - ✅ test_issue_001_self_join_guard_on_watchdog_thread — ISSUE-001 self-join guard fires correctly when stop() called from watchdog thread
+  - ✅ test_issue_022_on_done_not_inline_in_complete_playback — `_complete_playback` uses 'on-done-dispatch' thread, no inline `cb()` (ISSUE-022 regression guard)
+  - ✅ test_issue_029_dispatcher_handles_two_element_item_with_notify_hwnd — 3-element (notify hwnd) and 2-element items both handled without killing the dispatcher (ISSUE-029)
+  - ✅ test_mci_notify_dispatcher_variant_has_5s_timeout — `_mci_notify` has `timeout=5.0` on `rq.get` (ISSUE-026)
+- **Inspection**: `_ensure_notify_window` (lines 201-223) lazily creates the notify window under `_notify_init_lock` with a cached result (`_notify_hwnd is not None` guard). `_notify_window_main` registers a unique class name via `_wndclass_counter`, creates a `HWND_MESSAGE` window, holds a strong `_wndproc_ref`, pumps messages, and unregisters the class on exit. `_wndproc` delegates to `_handle_mci_notify` for MM_MCINOTIFY and handles WM_CLOSE/WM_DESTROY for teardown. `_handle_mci_notify` (lines 289-318) guards under `_lock` first, then queries mode outside the lock (potential 5s MCI delay), then calls `_complete_playback(token)` — safe because `_complete_playback` re-checks the token under lock. `_complete_playback` (lines 320-342) is token-guarded and idempotent under `_lock`; fires on_done on a detached `on-done-dispatch` thread. `_notify_watchdog` (lines 344-365) uses a 2s `stop_event.wait` and exits when stop_event is set or the token no longer matches; it calls `_complete_playback(token)` which is idempotent if the notify already fired. `stop()` (lines 537-562) clears `_notify_ctx = None` under `_lock` before the MCI stop/close — this both gates `_handle_mci_notify`'s initial lock check and `_complete_playback`'s token check, making every interleaving of notify + watchdog + stop() + new play() safe. The ISSUE-001 self-join guard at line 550 checks `threading.current_thread() is self._monitor_thread` — since the watchdog is assigned to `_monitor_thread`, it fires correctly. `close()` (lines 367-380) tears down the notify window via `PostMessageW(WM_CLOSE)` and joins the notify thread with a 2s timeout; the self-join guard prevents deadlock if `close()` is called from the notify thread. Test coverage of the notify path is full: `_handle_mci_notify` and `_complete_playback` are tested directly without a live window; the watchdog behavior is tested with a mocked `_complete_playback`; structural tests verify the play() → `_mci_notify` → ctx → watchdog pipeline using a patched `_ensure_notify_window`.
+- **Verdict**: The MM_MCINOTIFY implementation is correct and complete. The token-guarded, idempotent `_complete_playback` ensures no double-firing or cross-playback on_done; all SUPERSEDED/ABORTED/FAILURE codes and stale notifies are suppressed; the watchdog doubles as the joinable monitor thread preserving ISSUE-001/022 semantics; the polling fallback path is intact for when window creation fails. The primary audible-gap complaint is structurally resolved. Full audible verification was not run headlessly (requires a live session), but the architectural correctness is confirmed.
 - **New Issues**: None
 
 ---

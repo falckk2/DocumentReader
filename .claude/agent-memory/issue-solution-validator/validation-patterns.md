@@ -58,6 +58,19 @@ Test `test_restore_bookmark_clamps_sentence_idx` checks for `'min('` in source. 
 - A "stale done" queued in Tk's event queue is beyond generation-bump suppression (the bump gates on_done BEFORE event_generate); app-level effects of an already-queued done must be argued benign, not assumed suppressed.
 - Debounced-restart pattern (`after(300)` + cancel-on-tick + fire-time state re-check + cancel in `_stop`) is the validated shape for "apply control change to in-flight sentence". The fire-time guard set is `_reading / not _paused / idx>0 / sentences truthy`; `_stop` gives triple protection (cancel + flag + idx=0). Distinct after-id fields can't collide — Tk after ids are unique per scheduled callback.
 
+## MCI Notify / Win32 Window Testing Patterns (ISSUE-011, validated 2026-06-12)
+- Under tests `ctypes.WinDLL` is patched to a `MagicMock`, so all Win32 calls are mocks. `_ensure_notify_window` always returns 0 (fallback) — expected by design, not a regression.
+- To test the notify path without a real window: `player._ensure_notify_window = MagicMock(return_value=0x9999)` and stub `ap._mci_notify = MagicMock(return_value=0)`. This drives the `hwnd != 0` branch in `play()`, installs `_notify_ctx`, and starts the watchdog thread.
+- `_handle_mci_notify` and `_complete_playback` are directly testable without any window: manually install `_notify_ctx` and call the methods; no Win32 plumbing needed.
+- `inspect.getsource()` fails on module-level functions that are patched to `MagicMock` at import time. Workaround: read the source file with `open(...)` and search the raw text.
+- The `_wndclass_counter = itertools.count()` is module-global; calling `next(_wndclass_counter)` in a test advances it permanently — safe for the tests but be aware when asserting exact counter values.
+- Watchdog behavior is testable by replacing `player._complete_playback` with a callable mock and controlling `_mci_query` return values; the watchdog exits when the mock sets `stop_event`.
+
+## Notify Token Safety Analysis (ISSUE-011)
+- Token races (notify + watchdog both fire simultaneously, stop + notify race, new play + queued old notify) are all safe because `_complete_playback` re-checks `ctx["token"] != token` under `_lock`. This is the ISSUE-028 per-playback pattern applied to the notify path.
+- The only cross-lock gap: `_handle_mci_notify` reads token under lock, releases, queries MCI mode (up to 5s), then calls `_complete_playback(token)`. During that window stop+play could have cycled multiple times. Safe: `_complete_playback` re-checks under lock.
+- `stop()` clears `_notify_ctx = None` under `_lock` as the FIRST action (before MCI stop/close). This means any concurrent `_handle_mci_notify` acquiring `_lock` after will see `ctx is None` and return. Any that acquired `_lock` BEFORE will have its token mismatch caught by `_complete_playback` after the new play() installs a higher token.
+
 ## Status Values
 - `VALIDATED ✅` — fix confirmed correct, issue resolved
 - `PARTIAL ⚠️` — known remaining gap documented, partial fix is correct
