@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import tempfile
 import tkinter as tk
 import tkinter.filedialog as fd
 import tkinter.messagebox as mb
@@ -43,6 +44,10 @@ class DocumentReaderApp(ctk.CTk):
         # to the sentence pump's page-done scheduling) so the two can never
         # cancel each other's callbacks.
         self._speed_debounce_id = None
+
+        # ISSUE-036 fix: serialize bookmark read-modify-write cycles
+        # so rapid pause-then-stop (or concurrent saves) never lose data.
+        self._bookmark_lock = threading.Lock()
 
         # ISSUE-003 fix: used by _on_sentence_done (background thread) to
         # marshal "sentence done" notifications safely to the GUI thread via
@@ -469,7 +474,10 @@ class DocumentReaderApp(ctk.CTk):
         # so repeated phrases on the same page are highlighted in order.
         self._text_box.configure(state="normal")
         self._text_box.tag_remove("highlight", "1.0", "end")
-        search_key = sentence[:40]
+        # ISSUE-032 fix: use the full sentence as the search key instead
+        # of truncating to 40 chars, which caused false matches on sentences
+        # sharing a common prefix longer than 40 characters.
+        search_key = sentence[:200] if len(sentence) > 200 else sentence
         pos = self._text_box.search(
             search_key, self._highlight_search_start, stopindex="end", nocase=False
         )
@@ -568,29 +576,45 @@ class DocumentReaderApp(ctk.CTk):
         """Persist current (or explicitly given) page + sentence index for the open PDF."""
         if not self._current_pdf_path:
             return
-        bookmarks = self._load_bookmarks()
-        bookmarks[self._current_pdf_path] = {
-            "page": self._current_page if page is None else page,
-            "sentence_idx": self._sentence_idx if sentence_idx is None else sentence_idx,
-        }
-        log.debug("Saving bookmark for %s: %r",
-                  self._current_pdf_path, bookmarks[self._current_pdf_path])
-        self._write_bookmarks(bookmarks)
+        # ISSUE-036 fix: serialize the read-modify-write cycle.
+        with self._bookmark_lock:
+            bookmarks = self._load_bookmarks()
+            bookmarks[self._current_pdf_path] = {
+                "page": self._current_page if page is None else page,
+                "sentence_idx": self._sentence_idx if sentence_idx is None else sentence_idx,
+            }
+            log.debug("Saving bookmark for %s: %r",
+                      self._current_pdf_path, bookmarks[self._current_pdf_path])
+            self._write_bookmarks(bookmarks)
 
     def _clear_bookmark(self):
         """ISSUE-025 fix: remove the bookmark for the open PDF (document fully read)."""
         if not self._current_pdf_path:
             return
-        bookmarks = self._load_bookmarks()
-        if self._current_pdf_path in bookmarks:
-            del bookmarks[self._current_pdf_path]
-            log.debug("Cleared bookmark for %s", self._current_pdf_path)
-            self._write_bookmarks(bookmarks)
+        # ISSUE-036 fix: serialize the read-modify-write cycle.
+        with self._bookmark_lock:
+            bookmarks = self._load_bookmarks()
+            if self._current_pdf_path in bookmarks:
+                del bookmarks[self._current_pdf_path]
+                log.debug("Cleared bookmark for %s", self._current_pdf_path)
+                self._write_bookmarks(bookmarks)
 
     def _write_bookmarks(self, bookmarks: dict):
+        # ISSUE-036 fix: atomic write via temp file + os.replace so a crash
+        # mid-write cannot leave a truncated/empty bookmarks file.
         try:
-            with open(_BOOKMARKS_FILE, "w", encoding="utf-8") as f:
-                json.dump(bookmarks, f, indent=2)
+            fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(_BOOKMARKS_FILE) or ".",
+                                             prefix=".bookmarks-", suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(bookmarks, f, indent=2)
+            except Exception:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
+            os.replace(tmp_path, _BOOKMARKS_FILE)
         except OSError as e:
             log.error("Failed to write bookmarks file %s: %s", _BOOKMARKS_FILE, e)
 
@@ -668,6 +692,9 @@ class DocumentReaderApp(ctk.CTk):
             if self._reading and not self._paused and self._sentence_idx > 0:
                 self._sentence_idx -= 1
             self._save_bookmark()
+        # ISSUE-035 fix: close the player (tears down the MCI notify window)
+        # after stopping playback.
         self._tts.stop()
+        self._tts.close()
         self._pdf.close()
         self.destroy()

@@ -27,16 +27,24 @@ class VoiceManager:
     def load(self, on_done=None):
         """Load voices in a background thread. Calls on_done(voices) when complete."""
         def _load():
-            voices = []
-            offline = self._load_offline_voices()
-            online = self._load_online_voices()
-            log.info("Voice load: %d offline, %d online", len(offline), len(online))
-            voices.extend(offline)
-            voices.extend(online)
-            self._voices = voices
-            self._loaded = True
-            if on_done:
-                on_done(voices)
+            # ISSUE-034 fix: wrap the entire load body so an unexpected
+            # exception still calls on_done (leaving the UI stuck on
+            # "Loading voices…" forever is worse than reporting failure).
+            try:
+                voices = []
+                offline = self._load_offline_voices()
+                online = self._load_online_voices()
+                log.info("Voice load: %d offline, %d online", len(offline), len(online))
+                voices.extend(offline)
+                voices.extend(online)
+                self._voices = voices
+                self._loaded = True
+            except Exception:
+                log.exception("Unexpected error loading voices")
+                voices = []
+            finally:
+                if on_done:
+                    on_done(voices)
 
         t = threading.Thread(target=_load, daemon=True)
         t.start()

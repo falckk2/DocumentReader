@@ -101,6 +101,11 @@ class TTSEngine:
         # monitor), so no synth/play thread still holds a reference.
         self._cleanup_tmp()
 
+    def close(self):
+        """ISSUE-035 fix: tear down the player (releases the MCI notify window)."""
+        self.stop()
+        self._player.close()
+
     def _bump_generation(self) -> int:
         """ISSUE-017 fix: invalidate all in-flight utterances."""
         with self._gen_lock:

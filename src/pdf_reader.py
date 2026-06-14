@@ -68,7 +68,10 @@ class PDFReader:
         if not text:
             return []
         # Split on sentence-ending punctuation followed by whitespace or end
-        raw = re.split(r"(?<=[.!?])\s+", text)
+        # ISSUE-033 fix: also split on sentence-ending punctuation at
+        # end-of-string (no trailing whitespace), so the last sentence on a
+        # page is not silently concatenated with the preceding one.
+        raw = re.split(r"(?<=[.!?])\s+|(?<=[.!?])$", text)
         sentences = [s.strip() for s in raw if s.strip()]
         return sentences
 
