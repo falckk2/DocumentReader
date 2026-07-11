@@ -62,9 +62,9 @@ class PDFReader:
         text = re.sub(r"\n{3,}", "\n\n", text)
         return text.strip()
 
-    def get_sentences(self, page_index: int) -> list[str]:
-        """Split page text into readable sentences."""
-        text = self.get_page_text(page_index)
+    @staticmethod
+    def _split_sentences(text: str) -> list[str]:
+        """Split already-extracted page text into readable sentences."""
         if not text:
             return []
         # Split on sentence-ending punctuation followed by whitespace or end
@@ -72,9 +72,27 @@ class PDFReader:
         # end-of-string (no trailing whitespace), so the last sentence on a
         # page is not silently concatenated with the preceding one.
         raw = re.split(r"(?<=[.!?])\s+|(?<=[.!?])$", text)
-        sentences = [s.strip() for s in raw if s.strip()]
-        return sentences
+        return [s.strip() for s in raw if s.strip()]
+
+    def get_sentences(self, page_index: int) -> list[str]:
+        """Split page text into readable sentences."""
+        text = self.get_page_text(page_index)
+        return self._split_sentences(text)
 
     def get_all_text(self, page_index: int) -> str:
         """Return full page text for display in the UI."""
         return self.get_page_text(page_index)
+
+    def get_text_and_sentences(self, page_index: int) -> tuple[str, list[str]]:
+        """Extract page text once and return both the raw text and its
+        sentence split.
+
+        ISSUE-039 fix: callers that need both the display text and the
+        sentence list (e.g. `_update_page_display`, `_restore_bookmark` in
+        app.py) previously called `get_all_text` and `get_sentences`
+        separately, each of which independently re-ran `get_page_text` (a
+        PyMuPDF extraction + regex normalization) for the identical page.
+        This method extracts once and derives both results from it.
+        """
+        text = self.get_page_text(page_index)
+        return text, self._split_sentences(text)

@@ -20,6 +20,9 @@ Test `test_uses_event_generate_not_after` fails because it does a substring sear
 ### ISSUE-009: `min()` vs `if/max` equivalence
 Test `test_restore_bookmark_clamps_sentence_idx` checks for `'min('` in source. The fix uses `max_idx = max(0, len(self._sentences) - 1); if sentence_idx > max_idx: sentence_idx = max_idx` which is functionally identical to `min(sentence_idx, max(0, ...))`. Test assertion is overly prescriptive about implementation style.
 
+### Recurring pattern: fix-explanation comments quote the OLD API/call they replaced
+Seen 3x now (ISSUE-003, ISSUE-032, ISSUE-034). This codebase's fix comments explain the change by naming what was removed, e.g. `# this used to call self.after() directly` or `# instead of get_all_text() and get_sentences() each separately`. A raw `assertNotIn("self.after(", src)` / `assertNotIn("get_all_text(", src)` over `inspect.getsource()` output will false-positive on these comments. **Always write a `_strip_comments()` helper** (split each line on `#`, drop lines that are pure comments) and assert against the comment-stripped code, not the raw source, whenever the assertion is "old pattern X does NOT appear anymore." Assertions that check something DOES appear (`assertIn`) are safe to run against raw source since matching in a comment is not a real failure to catch.
+
 ## Test Design Guidelines Learned
 - When testing "method X does NOT call Y", check that Y is not in the *executable* code, not just the source string (comments can cause false positives)
 - When testing "implementation uses function F", prefer checking for behavior/equivalence rather than requiring a specific function name

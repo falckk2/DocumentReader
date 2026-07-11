@@ -937,6 +937,7 @@ class TestIssue016ImmediateSpeedApply(unittest.TestCase):
         app = self._make_app(reading=True, paused=False, sentence_idx=2,
                              debounce_id="speed#7")
         app._pdf = MagicMock()
+        app._voices_ready = True  # ISSUE-038: _stop's play_btn gate reads this
         app._tts = MagicMock()
         app._pending_after_id = None
         app._save_bookmark = MagicMock()
@@ -2060,6 +2061,7 @@ class TestIssue025CompletionBookmark(unittest.TestCase):
                            "C:/other.pdf": {"page": 0, "sentence_idx": 5}}, f)
             app = app_mod.DocumentReaderApp.__new__(app_mod.DocumentReaderApp)
             app._current_pdf_path = "C:/doc.pdf"
+            app._bookmark_lock = threading.Lock()  # ISSUE-036: bookmark ops serialize on this
             with patch.object(app_mod, "_BOOKMARKS_FILE", path):
                 app._clear_bookmark()
             with open(path, encoding="utf-8") as f:
@@ -2087,6 +2089,7 @@ class TestIssue025CompletionBookmark(unittest.TestCase):
                 _json.dump({"C:/doc.pdf": {"page": 3, "sentence_idx": 6}}, f)
             app = app_mod.DocumentReaderApp.__new__(app_mod.DocumentReaderApp)
             app._current_pdf_path = "C:/doc.pdf"
+            app._bookmark_lock = threading.Lock()  # ISSUE-036: bookmark ops serialize on this
             app._current_page = 4              # last page (0-based) of 5
             app._sentence_idx = 0
             app._reading = True                # last sentence just finished
@@ -2587,6 +2590,7 @@ class TestIssue031OnlineResumeReadvance(unittest.TestCase):
         app._clear_highlight = MagicMock()
         app._pending_after_id = None
         app._speed_debounce_id = None   # ISSUE-016: cleared by _stop
+        app._voices_ready = True        # ISSUE-038: _stop's play_btn gate reads this
         return app
 
     def test_play_source_readvances_index_on_resume(self):
@@ -2688,6 +2692,426 @@ class TestIssue031OnlineResumeReadvance(unittest.TestCase):
         app._play()
         self.assertEqual(app._sentence_idx, 2,
                          "index drifted across repeated pause/resume cycles")
+
+
+# ---------------------------------------------------------------------------
+# ISSUE-037 — _load_voices.on_done must marshal via event_generate, not after()
+# ---------------------------------------------------------------------------
+
+class _FakeVoiceStr:
+    """Minimal stand-in for a Voice whose __str__ is what _load_voices uses
+    to build the dropdown display list."""
+
+    def __init__(self, s):
+        self._s = s
+
+    def __str__(self):
+        return self._s
+
+
+class TestIssue037ThreadSafeVoiceLoadCallback(unittest.TestCase):
+    """_load_voices.on_done (invoked on the VoiceManager background thread)
+    must not call self.after() — it must stash a result and marshal to the
+    GUI thread via event_generate(when='tail'), mirroring ISSUE-003."""
+
+    @staticmethod
+    def _strip_comments(src: str) -> str:
+        # Same technique as the ISSUE-003 false-positive fix: the fix's own
+        # explanatory comments mention "self.after()" in prose, so a raw
+        # substring search over the full source is not reliable.
+        lines = []
+        for line in src.splitlines():
+            if line.lstrip().startswith("#"):
+                continue
+            lines.append(line.split("#", 1)[0])
+        return "\n".join(lines)
+
+    def _get_load_voices_src(self):
+        import src.app as app_mod
+        return inspect.getsource(app_mod.DocumentReaderApp._load_voices)
+
+    def test_on_done_does_not_call_after_in_executable_code(self):
+        code_only = self._strip_comments(self._get_load_voices_src())
+        self.assertNotIn("self.after(", code_only,
+                         "_load_voices.on_done must not call self.after() from "
+                         "the VoiceManager background thread (ISSUE-037)")
+
+    def test_on_done_uses_event_generate_tail(self):
+        src = self._get_load_voices_src()
+        self.assertIn("event_generate", src,
+                      "_load_voices.on_done must call event_generate for thread safety")
+        self.assertIn('"tail"', src,
+                      "event_generate in _load_voices should use when='tail'")
+
+    def test_voices_loaded_event_handler_exists(self):
+        import src.app as app_mod
+        self.assertTrue(
+            hasattr(app_mod.DocumentReaderApp, "_on_voices_loaded_event"),
+            "Missing _on_voices_loaded_event handler (ISSUE-037 fix incomplete)"
+        )
+
+    def test_voices_loaded_event_bound_in_init(self):
+        import src.app as app_mod
+        src = inspect.getsource(app_mod.DocumentReaderApp.__init__)
+        self.assertIn("<<VoicesLoaded>>", src,
+                      "<<VoicesLoaded>> event not bound in __init__")
+
+    def _make_app(self):
+        import src.app as app_mod
+        app = app_mod.DocumentReaderApp.__new__(app_mod.DocumentReaderApp)
+        app._voices = MagicMock()
+        app._pdf = MagicMock()
+        app._pdf.is_open = False
+        app._voices_loaded_event = "<<VoicesLoaded>>"
+        app._voices_load_result = None
+        app._voices_ready = False
+        app._set_status = MagicMock()
+        app._voice_menu = MagicMock()
+        app._voice_var = MagicMock()
+        app._play_btn = MagicMock()
+        app.event_generate = MagicMock()
+        return app
+
+    def test_on_done_runs_on_background_thread_and_signals_via_event(self):
+        """Reproduces the real VoiceManager.load() invocation: on_done must
+        complete off the GUI thread without touching self.after(), then
+        signal completion via event_generate."""
+        app = self._make_app()
+        app._voices.get_default_voice = MagicMock(return_value=None)
+        captured = {}
+
+        def fake_load(on_done):
+            def _bg():
+                captured["thread"] = threading.current_thread()
+                on_done([_FakeVoiceStr("[Online] Voice A (en-US)")])
+            t = threading.Thread(target=_bg)
+            t.start()
+            t.join(timeout=2)
+
+        app._voices.load = fake_load
+        app._load_voices()
+
+        self.assertIsNot(captured.get("thread"), threading.main_thread(),
+                         "test sanity check: on_done should run on a background thread")
+        app.event_generate.assert_called_once_with("<<VoicesLoaded>>", when="tail")
+        self.assertIn("display", app._voices_load_result)
+        self.assertEqual(app._voices_load_result["display"], ["[Online] Voice A (en-US)"])
+
+    def test_result_stashed_before_event_generate_fires(self):
+        """event_generate must only fire AFTER _voices_load_result is fully
+        written, so the GUI-thread handler can never observe a stale/None
+        result for a completed load."""
+        app = self._make_app()
+        app._voices.get_default_voice = MagicMock(return_value=None)
+        seen = []
+        app.event_generate = MagicMock(
+            side_effect=lambda *a, **k: seen.append(app._voices_load_result))
+        app._voices.load = lambda on_done: on_done([_FakeVoiceStr("[Offline] Voice B (en-GB)")])
+
+        app._load_voices()
+
+        self.assertEqual(len(seen), 1)
+        self.assertIsNotNone(seen[0], "on_done result was not stashed before event_generate")
+        self.assertIn("display", seen[0])
+
+    def test_empty_voices_produces_status_only_result(self):
+        app = self._make_app()
+        app._voices.load = lambda on_done: on_done([])
+        app._load_voices()
+        self.assertEqual(app._voices_load_result, {"status": "No voices found"})
+        app.event_generate.assert_called_once_with("<<VoicesLoaded>>", when="tail")
+
+    def test_exception_in_on_done_produces_error_result_not_raise(self):
+        app = self._make_app()
+        app._voices.get_default_voice = MagicMock(side_effect=RuntimeError("boom"))
+        app._voices.load = lambda on_done: on_done([_FakeVoiceStr("X")])
+        app._load_voices()  # must not raise
+        self.assertEqual(app._voices_load_result, {"status": "Error loading voices"})
+        app.event_generate.assert_called_once_with("<<VoicesLoaded>>", when="tail")
+
+    def test_event_generate_exception_is_swallowed(self):
+        """If the window is closing, event_generate can raise; on_done must
+        not propagate that into the VoiceManager background thread."""
+        app = self._make_app()
+        app._voices.get_default_voice = MagicMock(return_value=None)
+        app.event_generate = MagicMock(side_effect=RuntimeError("window closed"))
+        app._voices.load = lambda on_done: on_done([_FakeVoiceStr("X")])
+        app._load_voices()  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# ISSUE-038 — Play must stay disabled until voice discovery actually finishes
+# ---------------------------------------------------------------------------
+
+class TestIssue038PlayGatedOnVoicesReady(unittest.TestCase):
+
+    def test_voices_ready_initialized_false_in_init(self):
+        import src.app as app_mod
+        src = inspect.getsource(app_mod.DocumentReaderApp.__init__)
+        self.assertIn("_voices_ready = False", src,
+                      "_voices_ready must default to False in __init__ (ISSUE-038)")
+
+    def test_stop_play_btn_gate_checks_voices_ready(self):
+        import src.app as app_mod
+        src = inspect.getsource(app_mod.DocumentReaderApp._stop)
+        self.assertIn("_voices_ready", src,
+                      "_stop()'s play-button restore must also require "
+                      "_voices_ready, not just self._pdf.is_open (ISSUE-038)")
+
+    # -- _open_pdf gating -----------------------------------------------
+
+    def _make_open_pdf_app(self, voices_ready):
+        import src.app as app_mod
+        app = app_mod.DocumentReaderApp.__new__(app_mod.DocumentReaderApp)
+        app._pdf = MagicMock()
+        app._pdf.open = MagicMock(return_value=5)
+        app._stop = MagicMock()
+        app._title_label = MagicMock()
+        app._set_status = MagicMock()
+        app._update_page_display = MagicMock()
+        app._update_nav_buttons = MagicMock()
+        app._restore_bookmark = MagicMock()
+        app._play_btn = MagicMock()
+        app._voices_ready = voices_ready
+        app._current_pdf_path = None
+        app._current_page = 0
+        return app
+
+    def test_open_pdf_does_not_enable_play_while_voices_still_loading(self):
+        import src.app as app_mod
+        app = self._make_open_pdf_app(voices_ready=False)
+        with patch.object(app_mod.fd, "askopenfilename", return_value="/fake/doc.pdf"):
+            app._open_pdf()
+        app._play_btn.configure.assert_not_called()
+
+    def test_open_pdf_enables_play_when_voices_already_ready(self):
+        import src.app as app_mod
+        app = self._make_open_pdf_app(voices_ready=True)
+        with patch.object(app_mod.fd, "askopenfilename", return_value="/fake/doc.pdf"):
+            app._open_pdf()
+        app._play_btn.configure.assert_called_once_with(state="normal")
+
+    # -- _on_voices_loaded_event gating -----------------------------------
+
+    def _make_voices_event_app(self, pdf_open):
+        import src.app as app_mod
+        app = app_mod.DocumentReaderApp.__new__(app_mod.DocumentReaderApp)
+        app._pdf = MagicMock()
+        app._pdf.is_open = pdf_open
+        app._voices_ready = False
+        app._set_status = MagicMock()
+        app._voice_menu = MagicMock()
+        app._voice_var = MagicMock()
+        app._play_btn = MagicMock()
+        return app
+
+    def test_voices_loaded_enables_play_if_pdf_already_open(self):
+        app = self._make_voices_event_app(pdf_open=True)
+        app._voices_load_result = {
+            "display": ["[Online] Voice A (en-US)"],
+            "default_str": "[Online] Voice A (en-US)",
+            "status": "1 voices loaded",
+        }
+        app._on_voices_loaded_event()
+        self.assertTrue(app._voices_ready)
+        app._play_btn.configure.assert_called_once_with(state="normal")
+
+    def test_voices_loaded_does_not_touch_play_btn_if_no_pdf_open(self):
+        app = self._make_voices_event_app(pdf_open=False)
+        app._voices_load_result = {
+            "display": ["[Online] Voice A (en-US)"],
+            "default_str": "[Online] Voice A (en-US)",
+            "status": "1 voices loaded",
+        }
+        app._on_voices_loaded_event()
+        self.assertTrue(app._voices_ready, "successful load must still set _voices_ready")
+        app._play_btn.configure.assert_not_called()
+
+    def test_voices_loaded_does_not_set_ready_on_empty_result(self):
+        """Zero usable voices: Play genuinely can't work, so _voices_ready
+        must stay False even though the load 'completed'."""
+        app = self._make_voices_event_app(pdf_open=True)
+        app._voices_load_result = {"status": "No voices found"}
+        app._on_voices_loaded_event()
+        self.assertFalse(app._voices_ready)
+        app._play_btn.configure.assert_not_called()
+
+    def test_voices_loaded_does_not_set_ready_on_error_result(self):
+        app = self._make_voices_event_app(pdf_open=True)
+        app._voices_load_result = {"status": "Error loading voices"}
+        app._on_voices_loaded_event()
+        self.assertFalse(app._voices_ready)
+        app._play_btn.configure.assert_not_called()
+
+    # -- _stop()'s play-button restore -------------------------------------
+
+    def _make_stop_app(self, pdf_open, voices_ready):
+        import src.app as app_mod
+        app = app_mod.DocumentReaderApp.__new__(app_mod.DocumentReaderApp)
+        app._reading = False
+        app._paused = False
+        app._sentence_idx = 0
+        app._pending_after_id = None
+        app._speed_debounce_id = None
+        app._tts = MagicMock()
+        app._pdf = MagicMock()
+        app._pdf.is_open = pdf_open
+        app._voices_ready = voices_ready
+        app._clear_highlight = MagicMock()
+        app._play_btn = MagicMock()
+        app._pause_btn = MagicMock()
+        app._stop_btn = MagicMock()
+        return app
+
+    def test_stop_disables_play_when_voices_not_ready_even_if_pdf_open(self):
+        """Regression guard: before ISSUE-038, _stop() re-enabled Play purely
+        on self._pdf.is_open, which could re-enable it mid voice-load when a
+        second PDF is opened while the first was still open."""
+        app = self._make_stop_app(pdf_open=True, voices_ready=False)
+        app._stop()
+        app._play_btn.configure.assert_called_once_with(state="disabled", text="▶  Play")
+
+    def test_stop_enables_play_when_pdf_open_and_voices_ready(self):
+        app = self._make_stop_app(pdf_open=True, voices_ready=True)
+        app._stop()
+        app._play_btn.configure.assert_called_once_with(state="normal", text="▶  Play")
+
+    def test_stop_disables_play_when_no_pdf_open_even_if_voices_ready(self):
+        app = self._make_stop_app(pdf_open=False, voices_ready=True)
+        app._stop()
+        app._play_btn.configure.assert_called_once_with(state="disabled", text="▶  Play")
+
+    # -- ISSUE-031 regression check (shared _make_app fixture already sets
+    #    _voices_ready=True; re-verify here that _stop still behaves under
+    #    the combined gate for a fully-ready app) -----------------------
+
+    def test_stop_after_online_pause_resume_cycle_still_gates_correctly(self):
+        """Cross-issue check: ISSUE-031's pause/resume cycling must not
+        bypass the ISSUE-038 play-button gate on the final Stop."""
+        app = self._make_stop_app(pdf_open=True, voices_ready=True)
+        app._reading = True
+        app._paused = False
+        app._sentence_idx = 2
+        app._save_bookmark = MagicMock()
+        app._stop()
+        app._play_btn.configure.assert_called_once_with(state="normal", text="▶  Play")
+
+
+# ---------------------------------------------------------------------------
+# ISSUE-039 — page text extracted once and shared between text + sentences
+# ---------------------------------------------------------------------------
+
+class TestIssue039SinglePageExtraction(unittest.TestCase):
+
+    def _make_reader_with_fixed_text(self, text):
+        import src.pdf_reader as pr
+        mock_doc = MagicMock()
+        mock_doc.is_encrypted = False
+        mock_doc.__len__ = MagicMock(return_value=1)
+        page = MagicMock()
+        page.get_text = MagicMock(return_value=text)
+        mock_doc.__getitem__ = MagicMock(return_value=page)
+        with patch("fitz.open", return_value=mock_doc):
+            reader = pr.PDFReader()
+            reader.open("/fake/path.pdf")
+        return reader, page
+
+    def test_get_text_and_sentences_exists(self):
+        import src.pdf_reader as pr
+        self.assertTrue(hasattr(pr.PDFReader, "get_text_and_sentences"),
+                        "PDFReader.get_text_and_sentences is missing (ISSUE-039)")
+
+    def test_get_text_and_sentences_extracts_page_exactly_once(self):
+        text = "First sentence. Second sentence! Third one?"
+        reader, page = self._make_reader_with_fixed_text(text)
+        result_text, result_sentences = reader.get_text_and_sentences(0)
+        self.assertEqual(page.get_text.call_count, 1,
+                         "get_text_and_sentences must call PyMuPDF get_text() "
+                         "exactly once per page (ISSUE-039)")
+        self.assertEqual(result_text, text)
+        self.assertEqual(result_sentences,
+                         ["First sentence.", "Second sentence!", "Third one?"])
+
+    def test_get_text_and_sentences_matches_separate_calls(self):
+        """The combined call must return results identical to the old
+        get_all_text + get_sentences pair (no behavior change)."""
+        text = "Alpha beta. Gamma delta.\n\n\nEpsilon."
+        reader, _ = self._make_reader_with_fixed_text(text)
+        expected_text = reader.get_all_text(0)
+        expected_sentences = reader.get_sentences(0)
+        combined_text, combined_sentences = reader.get_text_and_sentences(0)
+        self.assertEqual(combined_text, expected_text)
+        self.assertEqual(combined_sentences, expected_sentences)
+
+    def test_get_text_and_sentences_empty_page(self):
+        reader, _ = self._make_reader_with_fixed_text("")
+        text, sentences = reader.get_text_and_sentences(0)
+        self.assertEqual(text, "")
+        self.assertEqual(sentences, [])
+
+    def test_get_text_and_sentences_out_of_range_page(self):
+        reader, page = self._make_reader_with_fixed_text("Some text.")
+        text, sentences = reader.get_text_and_sentences(99)
+        self.assertEqual(text, "")
+        self.assertEqual(sentences, [])
+        page.get_text.assert_not_called()
+
+    @staticmethod
+    def _strip_comments(src: str) -> str:
+        # Explanatory comments in this codebase reference the OLD API names
+        # being replaced (e.g. "instead of get_all_text() and get_sentences()"),
+        # so a raw substring search over full source is unreliable — same
+        # false-positive class documented for ISSUE-003/ISSUE-037. Strip
+        # comments before asserting absence of the old call pattern.
+        lines = []
+        for line in src.splitlines():
+            if line.lstrip().startswith("#"):
+                continue
+            lines.append(line.split("#", 1)[0])
+        return "\n".join(lines)
+
+    def test_update_page_display_uses_combined_extraction(self):
+        import src.app as app_mod
+        src = inspect.getsource(app_mod.DocumentReaderApp._update_page_display)
+        self.assertIn("get_text_and_sentences", src,
+                      "_update_page_display must use get_text_and_sentences (ISSUE-039)")
+        code_only = self._strip_comments(src)
+        self.assertNotIn("get_all_text(", code_only,
+                         "_update_page_display still calls get_all_text separately "
+                         "(double extraction regression)")
+        self.assertNotIn("self._pdf.get_sentences(", code_only,
+                         "_update_page_display still calls get_sentences separately "
+                         "(double extraction regression)")
+
+    def test_restore_bookmark_uses_combined_extraction(self):
+        import src.app as app_mod
+        src = inspect.getsource(app_mod.DocumentReaderApp._restore_bookmark)
+        self.assertIn("get_text_and_sentences", src,
+                      "_restore_bookmark must use get_text_and_sentences (ISSUE-039)")
+        code_only = self._strip_comments(src)
+        self.assertNotIn("get_all_text(", code_only,
+                         "_restore_bookmark still calls get_all_text separately "
+                         "(double extraction regression)")
+        self.assertNotIn("self._pdf.get_sentences(", code_only,
+                         "_restore_bookmark still calls get_sentences separately "
+                         "(double extraction regression)")
+
+    def test_app_update_page_display_calls_pdf_exactly_once(self):
+        """Behavioral: _update_page_display must call the PDFReader exactly
+        once per page load, not twice."""
+        import src.app as app_mod
+        app = app_mod.DocumentReaderApp.__new__(app_mod.DocumentReaderApp)
+        app._current_page = 0
+        app._pdf = MagicMock()
+        app._pdf.get_text_and_sentences = MagicMock(return_value=("Hello world.", ["Hello world."]))
+        app._pdf.get_all_text = MagicMock(side_effect=AssertionError("get_all_text must not be called"))
+        app._pdf.get_sentences = MagicMock(side_effect=AssertionError("get_sentences must not be called"))
+        app._pdf.page_count = 1
+        app._text_box = MagicMock()
+        app._page_label = MagicMock()
+        app._update_page_display()
+        app._pdf.get_text_and_sentences.assert_called_once_with(0)
+        self.assertEqual(app._sentences, ["Hello world."])
 
 
 if __name__ == "__main__":

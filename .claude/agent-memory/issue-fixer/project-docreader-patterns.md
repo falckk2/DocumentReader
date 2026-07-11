@@ -35,6 +35,10 @@ metadata:
 
 **How to apply:** When adding any new callback or inter-thread communication path, verify which thread it runs on before touching shared state or Tk widgets; gate any deferred callback on the current generation; never let the GUI thread wait unboundedly on another thread.
 
+**VoiceManager background thread has the same after()-thread-safety trap as the MCI/TTS threads:** ISSUE-032 found `_load_voices`'s `on_done` (invoked from `VoiceManager.load`'s daemon thread) calling `self.after(...)` three times — the exact ISSUE-003 violation, just in a different subsystem. Fixed with the identical event_generate pattern: background thread stashes a result dict on an instance attr, then `event_generate("<<VoicesLoaded>>", when="tail")`; a GUI-thread handler bound in `__init__` does the actual widget mutation. No lock needed since the attr is fully written before the event fires and `on_done` is only invoked once per `load()` call.
+
+**Readiness gates need to be checked from BOTH directions:** ISSUE-033 (Play enabled before async voice load finishes) required gating in two places, not one — `_open_pdf` checks `self._voices_ready` before enabling Play (handles PDF-opens-after-voices-ready), and the voices-loaded GUI handler checks `self._pdf.is_open` before enabling Play (handles PDF-opens-before-voices-ready). Missed a third spot on the first pass: `_stop()` unconditionally re-enables Play based on `self._pdf.is_open` alone, but `_stop()` runs at the top of `_open_pdf` while a *previous* document may still be open — opening a second PDF during the voice-load window would have re-enabled Play prematurely through that path. Any new boolean readiness flag gating a button must be threaded through every place that button's state is set, not just the "happy path" setter.
+
 ## Settled design decisions (do not re-litigate)
 
 - ISSUE-016 (user decision 2026-06-12): SPEED slider changes apply IMMEDIATELY during playback via a 300ms-debounced restart of the current sentence (`_apply_speed_change` in app.py, debounce id `_speed_debounce_id`, cancelled in `_stop`). VOICE changes stay deferred to the next sentence — that is intentional design, and `test_voice_change_handler_is_pass` pins it.
@@ -46,6 +50,7 @@ metadata:
 - The old 2 test ERRORs (`KeyError: 'src.tts_engine'` in TestIssue002) were fixed by the validator on 2026-06-12 (explicit import in setUp); as of ISSUE-016's fix (2026-06-12) the suite baseline is fully green at 149 tests.
 - pytest is NOT installed (Python 3.14); run the suite with `python -m unittest tests.test_issue_validations`.
 - `test_queue_command_format` / ISSUE-013 tests pin the pyttsx3 queue tuple `("speak", text, voice_id, rate_wpm, on_done)` — extend behavior via closures over on_done, not by changing the tuple.
+- Added `_voices_ready` (ISSUE-033) to the growing list of instance fields `_stop()` reads: `tests/test_issue_validations.py`'s `TestIssue016ImmediateSpeedApply.test_stop_cancels_pending_speed_debounce` and `TestIssue031OnlineResumeReadvance._make_app` both build the app via `__new__` and call the real `_stop()` — both needed `app._voices_ready = True` added. Grep the test file for every `_make_app`/`__new__` fixture that calls a real (non-mocked) `_stop`/`_open_pdf`/`_play` before adding a field those methods read.
 
 ## Known follow-up (not yet filed as an issue)
 

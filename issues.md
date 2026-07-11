@@ -1,10 +1,8 @@
 # Issues Log
 
-_Last updated: 2026-06-12_
+_Last updated: 2026-07-11 (ISSUE-032/033/034 validated)_
 
 Issues are sorted by status: OPEN → NEEDS_REVIEW → FIXED → PARTIAL → VALIDATED. Append new issues at the appropriate status group; never delete old entries (change Status instead).
-
----
 
 ---
 
@@ -1175,6 +1173,137 @@ Issues are sorted by status: OPEN → NEEDS_REVIEW → FIXED → PARTIAL → VAL
   - ✅ test_mci_notify_dispatcher_variant_has_5s_timeout — `_mci_notify` has `timeout=5.0` on `rq.get` (ISSUE-026)
 - **Inspection**: `_ensure_notify_window` (lines 201-223) lazily creates the notify window under `_notify_init_lock` with a cached result (`_notify_hwnd is not None` guard). `_notify_window_main` registers a unique class name via `_wndclass_counter`, creates a `HWND_MESSAGE` window, holds a strong `_wndproc_ref`, pumps messages, and unregisters the class on exit. `_wndproc` delegates to `_handle_mci_notify` for MM_MCINOTIFY and handles WM_CLOSE/WM_DESTROY for teardown. `_handle_mci_notify` (lines 289-318) guards under `_lock` first, then queries mode outside the lock (potential 5s MCI delay), then calls `_complete_playback(token)` — safe because `_complete_playback` re-checks the token under lock. `_complete_playback` (lines 320-342) is token-guarded and idempotent under `_lock`; fires on_done on a detached `on-done-dispatch` thread. `_notify_watchdog` (lines 344-365) uses a 2s `stop_event.wait` and exits when stop_event is set or the token no longer matches; it calls `_complete_playback(token)` which is idempotent if the notify already fired. `stop()` (lines 537-562) clears `_notify_ctx = None` under `_lock` before the MCI stop/close — this both gates `_handle_mci_notify`'s initial lock check and `_complete_playback`'s token check, making every interleaving of notify + watchdog + stop() + new play() safe. The ISSUE-001 self-join guard at line 550 checks `threading.current_thread() is self._monitor_thread` — since the watchdog is assigned to `_monitor_thread`, it fires correctly. `close()` (lines 367-380) tears down the notify window via `PostMessageW(WM_CLOSE)` and joins the notify thread with a 2s timeout; the self-join guard prevents deadlock if `close()` is called from the notify thread. Test coverage of the notify path is full: `_handle_mci_notify` and `_complete_playback` are tested directly without a live window; the watchdog behavior is tested with a mocked `_complete_playback`; structural tests verify the play() → `_mci_notify` → ctx → watchdog pipeline using a patched `_ensure_notify_window`.
 - **Verdict**: The MM_MCINOTIFY implementation is correct and complete. The token-guarded, idempotent `_complete_playback` ensures no double-firing or cross-playback on_done; all SUPERSEDED/ABORTED/FAILURE codes and stale notifies are suppressed; the watchdog doubles as the joinable monitor thread preserving ISSUE-001/022 semantics; the polling fallback path is intact for when window creation fails. The primary audible-gap complaint is structurally resolved. Full audible verification was not run headlessly (requires a live session), but the architectural correctness is confirmed.
+- **New Issues**: None
+
+---
+
+## ISSUE-037 — `_load_voices` `on_done` calls `self.after()` from the VoiceManager background thread (Tk thread-safety violation)
+
+> Note: originally logged as ISSUE-032; renumbered to ISSUE-037 after merging a
+> concurrent round that had already published different issues as 032–036.
+
+**Status**: VALIDATED ✅
+**Severity**: HIGH
+
+### Discovery
+- **File**: `src/app.py` — `_load_voices.on_done` lines 212, 223, 226 (the `on_done(voices)` closure); invoked from `src/voice_manager.py` `load._load` line 39 (daemon thread)
+- **Description**: `VoiceManager.load()` runs `_load` on a daemon thread and calls `on_done(voices)` from that thread (`voice_manager.py` lines 29-42). The app's `on_done` closure then calls `self.after(0, ...)` three times — `self.after(0, lambda: self._set_status("No voices found"))` (line 212), `self.after(0, update)` (line 223), and `self.after(0, lambda: self._set_status("Error loading voices"))` (line 226). `tkinter`/customtkinter is not thread-safe: the Tcl interpreter must only be touched from the thread that created it, and `after()` mutates the interpreter's timer/event queue. This is the exact same violation ISSUE-003 identified and fixed for `_on_sentence_done` (which was converted to `event_generate`, "the only thread-safe Tk call from a non-GUI thread"). ISSUE-014 touched this same `on_done` but only wrapped it in try/except for exception visibility — it left the unsafe `after()` calls in place (its own Discovery text even shows `self.after(0, ...)`).
+- **Root Cause**: Cross-thread Tcl access — `after()` scheduled from a non-GUI thread. Only `event_generate` is documented safe from another thread.
+- **Impact**: Rare but real event-queue/interpreter corruption during startup voice discovery, most likely on slower machines or when the online `edge_tts.list_voices()` fetch returns while the GUI thread is busy. Symptoms range from a silently dropped voice-list update (UI stuck on "Loading voices…") to a hard Tcl crash. Non-deterministic and hard to reproduce, matching the ISSUE-003 risk profile.
+- **Reproduction**: Launch the app repeatedly under load so the background voice-load callback fires while the Tk mainloop is mid-redraw; occasionally the values update is lost or the interpreter faults. Deterministic reproduction is not expected (same as ISSUE-003).
+- **Depends On**: None
+- **Fix Suggestion**: Mirror the ISSUE-003 fix. Marshal to the GUI thread with a bound virtual event rather than `after()`: store the loaded voices/state on an instance attribute under a lock (or a `queue.Queue`), call `self.event_generate("<<VoicesLoaded>>", when="tail")` from `on_done`, and bind a GUI-thread handler (in `__init__`, after the window exists) that reads the stashed result and performs `_voice_menu.configure(...)` / `_voice_var.set(...)` / `_set_status(...)`. Handle the empty-voices and error cases through the same event with a status flag.
+- **Logging Added**: None — the existing `log.debug("Voice load callback fired with %d voices", ...)` plus the `%(threadName)s` field in the root log format (`main.py` line 24) already surface that this callback runs off the GUI thread.
+- **Date Found**: 2026-07-11
+
+### Fix
+- **Date**: 2026-07-11
+- **Changes**: `src/app.py`. Added `self._voices_loaded_event = "<<VoicesLoaded>>"` and `self._voices_load_result = None` in `__init__`, and bound the event to a new `_on_voices_loaded_event` handler right after the existing `<<SentenceDone>>` bind (both must happen after `_build_ui()` so the window exists). `_load_voices.on_done` (still runs on the VoiceManager background thread) now only computes the outcome — `{"status": ...}` for the empty/error cases, or `{"display": ..., "default_str": ..., "status": ...}` for success — and stashes it on `self._voices_load_result`, then calls `self.event_generate(self._voices_loaded_event, when="tail")` instead of any `self.after(...)` call. The new GUI-thread handler `_on_voices_loaded_event` reads `self._voices_load_result` and performs all the actual widget mutation (`_voice_menu.configure`, `_voice_var.set`, `_set_status`) that previously ran inside the background-thread-scheduled `after` callbacks. The original try/except/log.exception/"Error loading voices" wrapper (ISSUE-014) is preserved verbatim around the background-thread computation, just writing to the stashed result instead of scheduling `after()`. No lock is needed on `_voices_load_result`: it is fully written before `event_generate` is called, and `_load()` in `voice_manager.py` only ever invokes `on_done` once per `load()` call.
+
+### Validation
+- **Date**: 2026-07-11
+- **Method**: Tests + code inspection
+- **Tests**: `tests/test_issue_validations.py` — `TestIssue037ThreadSafeVoiceLoadCallback`: test_on_done_does_not_call_after_in_executable_code, test_on_done_uses_event_generate_tail, test_voices_loaded_event_handler_exists, test_voices_loaded_event_bound_in_init, test_on_done_runs_on_background_thread_and_signals_via_event, test_result_stashed_before_event_generate_fires, test_empty_voices_produces_status_only_result, test_exception_in_on_done_produces_error_result_not_raise, test_event_generate_exception_is_swallowed (9 tests)
+- **Results**: 9 passed, 0 failed
+  - ✅ test_on_done_does_not_call_after_in_executable_code — comment-stripped source contains no `self.after(` call (same false-positive class as ISSUE-003; comment text itself says "this used to call self.after()", so comments were stripped before asserting)
+  - ✅ test_on_done_uses_event_generate_tail
+  - ✅ test_voices_loaded_event_handler_exists
+  - ✅ test_voices_loaded_event_bound_in_init
+  - ✅ test_on_done_runs_on_background_thread_and_signals_via_event — behavioral: on_done invoked from a real spawned `threading.Thread` (not the test's main thread), completes without touching `self.after`, and calls `event_generate("<<VoicesLoaded>>", when="tail")` exactly once
+  - ✅ test_result_stashed_before_event_generate_fires — `_voices_load_result` is non-None and fully populated at the moment `event_generate` is invoked (happens-before ordering)
+  - ✅ test_empty_voices_produces_status_only_result
+  - ✅ test_exception_in_on_done_produces_error_result_not_raise — `get_default_voice()` raising inside on_done is caught, produces `{"status": "Error loading voices"}`, and still signals via event_generate rather than propagating into the VoiceManager background thread
+  - ✅ test_event_generate_exception_is_swallowed — a closing-window `event_generate` failure does not propagate
+- **Inspection**: `_load_voices.on_done` (app.py lines 220-253) runs entirely on the VoiceManager background thread; it only writes `self._voices_load_result` (three shapes: empty/error status-only, or success with `display`/`default_str`/`status`) and then calls `self.event_generate(self._voices_loaded_event, when="tail")` inside its own try/except so a closing window can't raise into the caller. No `self.after(...)` call exists anywhere in the method's executable code — the only occurrences of the string are in explanatory comments. `_on_voices_loaded_event` (lines 257-271) is bound to `<<VoicesLoaded>>` in `__init__` (line 77) after `_build_ui()`, matching the ISSUE-003 pattern exactly. The ISSUE-014 try/except/log.exception wrapper is preserved verbatim around the background-thread computation.
+- **Verdict**: Fix is confirmed correct and complete. The Tk thread-safety violation is eliminated using the same validated `event_generate` pattern as ISSUE-003, with no regression to the ISSUE-014 error-handling behavior.
+- **New Issues**: None
+
+---
+
+## ISSUE-038 — Play enabled before async voice load finishes; pressing Play yields "No voice selected" and silently stops
+
+> Note: originally logged as ISSUE-033; renumbered to ISSUE-038 after merging a
+> concurrent round that had already published different issues as 032–036.
+
+**Status**: VALIDATED ✅
+**Severity**: MEDIUM
+
+### Discovery
+- **File**: `src/app.py` — `_open_pdf` line 257 (`self._play_btn.configure(state="normal")`), `_read_next_sentence` lines 404-410, `__init__`/`_load_voices` (async load started at line 62)
+- **Description**: Voice discovery runs asynchronously (`_load_voices` → `VoiceManager.load` on a daemon thread), and the online branch calls `edge_tts.list_voices()`, which requires a network round-trip and can take several seconds. Meanwhile `_open_pdf` unconditionally enables the Play button (`_play_btn.configure(state="normal")`, line 257) as soon as a PDF opens. If the user opens a PDF and presses Play before voices finish loading, the voice dropdown still reads the placeholder `"Loading voices…"`. `_read_next_sentence` does `display = self._voice_var.get()` → `voice = self._voices.find_by_display(display)`, which returns `None` (no Voice matches the placeholder string), so it logs a warning, sets status "No voice selected.", and calls `self._stop()`. Playback appears broken even though voices would have been available moments later.
+- **Root Cause**: Play is gated only on "PDF open", not on "voices ready". The dropdown placeholder is not a valid voice, and there is no retry/deferral once voices arrive.
+- **Impact**: On a slow or offline network (edge-tts fetch stalls up to the ISSUE-023 path timeouts, or fails entirely leaving only offline voices after a delay), the user's first Play does nothing but show a terse status. Confusing "the reader is broken" UX during the startup window.
+- **Reproduction**: Throttle/disable the network, launch the app, immediately open a PDF, and press Play before the voice list populates. Observe "No voice selected." and no audio.
+- **Depends On**: None
+- **Fix Suggestion**: Keep `_play_btn` disabled until voices are loaded, enabling it from the voices-loaded GUI-thread handler (see ISSUE-037) only when a PDF is also open; or, in `_read_next_sentence`, when `find_by_display` returns `None` because voices are still loading, fall back to `self._voices.get_default_voice()` (and if that is also `None`, surface a clearer "Voices still loading — try again in a moment" status instead of a silent stop).
+- **Logging Added**: None — `_read_next_sentence` already logs `log.warning("No voice resolved for dropdown value %r; stopping", display)` (line 407), which records the placeholder value at the failure point.
+- **Date Found**: 2026-07-11
+
+### Fix
+- **Date**: 2026-07-11
+- **Changes**: `src/app.py`. Implemented the primary suggestion (gate Play on readiness, using the ISSUE-037 event handler). Added `self._voices_ready = False` in `__init__`. `_open_pdf` now only enables `_play_btn` when `self._voices_ready` is already `True` (covers PDF-opens-after-voices-ready). The new `_on_voices_loaded_event` handler (ISSUE-037) sets `self._voices_ready = True` on the successful-load branch only (not on the empty/error branches, since Play genuinely can't work with zero usable voices) and enables `_play_btn` if a PDF is already open (covers PDF-opens-before-voices-ready). Also hardened `_stop()`'s play-button restore line — it runs at the top of `_open_pdf` while the *previous* PDF may still be open, so `state="normal" if self._pdf.is_open else "disabled"` alone could have re-enabled Play mid-voice-load when opening a second PDF; changed the condition to `self._pdf.is_open and self._voices_ready`. Updated two test fixtures in `tests/test_issue_validations.py` (`TestIssue016ImmediateSpeedApply.test_stop_cancels_pending_speed_debounce` and `TestIssue031OnlineResumeReadvance._make_app`) to set `app._voices_ready = True` before calling the real `_stop()`, since it now reads that attribute (same pattern as prior `_speed_debounce_id` fixture updates noted in agent memory). Did not add the `_read_next_sentence` fallback-to-default-voice half of the suggestion — with Play now correctly gated, that path can no longer be reached with an unresolved placeholder voice, so it would be unreachable/redundant code.
+- **Validation**: Full suite `python -m unittest tests.test_issue_validations` — 181 passed, 0 failed after the fix.
+
+### Validation
+- **Date**: 2026-07-11
+- **Method**: Tests + code inspection
+- **Tests**: `tests/test_issue_validations.py` — `TestIssue038PlayGatedOnVoicesReady`: test_voices_ready_initialized_false_in_init, test_stop_play_btn_gate_checks_voices_ready, test_open_pdf_does_not_enable_play_while_voices_still_loading, test_open_pdf_enables_play_when_voices_already_ready, test_voices_loaded_enables_play_if_pdf_already_open, test_voices_loaded_does_not_touch_play_btn_if_no_pdf_open, test_voices_loaded_does_not_set_ready_on_empty_result, test_voices_loaded_does_not_set_ready_on_error_result, test_stop_disables_play_when_voices_not_ready_even_if_pdf_open, test_stop_enables_play_when_pdf_open_and_voices_ready, test_stop_disables_play_when_no_pdf_open_even_if_voices_ready, test_stop_after_online_pause_resume_cycle_still_gates_correctly (12 tests)
+- **Results**: 12 passed, 0 failed
+  - ✅ test_voices_ready_initialized_false_in_init
+  - ✅ test_stop_play_btn_gate_checks_voices_ready
+  - ✅ test_open_pdf_does_not_enable_play_while_voices_still_loading — behavioral: `_open_pdf()` run with `_voices_ready=False` never calls `_play_btn.configure` at all
+  - ✅ test_open_pdf_enables_play_when_voices_already_ready — behavioral: `_voices_ready=True` at open time enables Play immediately
+  - ✅ test_voices_loaded_enables_play_if_pdf_already_open — the reverse ordering (PDF opened first, voices arrive after)
+  - ✅ test_voices_loaded_does_not_touch_play_btn_if_no_pdf_open — `_voices_ready` still flips True, but no widget touch without an open PDF
+  - ✅ test_voices_loaded_does_not_set_ready_on_empty_result — zero usable voices leaves `_voices_ready=False` permanently (matches Fix rationale)
+  - ✅ test_voices_loaded_does_not_set_ready_on_error_result
+  - ✅ test_stop_disables_play_when_voices_not_ready_even_if_pdf_open — regression guard for the exact bug the Fix note calls out (second-PDF-during-voice-load re-enable)
+  - ✅ test_stop_enables_play_when_pdf_open_and_voices_ready
+  - ✅ test_stop_disables_play_when_no_pdf_open_even_if_voices_ready
+  - ✅ test_stop_after_online_pause_resume_cycle_still_gates_correctly — cross-issue check that ISSUE-031's pause/resume cycling does not bypass the ISSUE-038 gate on the terminating Stop
+- **Inspection**: `_open_pdf` (app.py lines 300-307) enables `_play_btn` only `if self._voices_ready:`, replacing the old unconditional enable. `_on_voices_loaded_event` (lines 257-271) sets `self._voices_ready = True` only inside the `"display" in result` branch and only then checks `self._pdf.is_open` to enable Play — confirmed the empty/error branches (`{"status": ...}` only, no `"display"` key) never reach that code path. `_stop()` (lines 442-445) restores Play with `state="normal" if (self._pdf.is_open and self._voices_ready) else "disabled"` — both prior single-condition bugs (stale enable on second-PDF-open, and the original ISSUE-038 bug) are closed by the conjunction. Confirmed the two test-fixture updates cited in the Fix (`TestIssue016ImmediateSpeedApply` line ~940, `TestIssue031OnlineResumeReadvance._make_app` line ~2591) are present and set `_voices_ready = True`, so pre-existing tests exercising `_stop()` continue to reflect a fully-ready app rather than silently asserting on a now-impossible state.
+- **Verdict**: Fix is confirmed correct and complete. Play can no longer be triggered against an unresolved placeholder voice in either open-then-load or load-then-open ordering, and the `_stop()` regression the fixer identified (second-PDF-open during voice-load re-enabling Play) is closed.
+- **New Issues**: None
+
+---
+
+## ISSUE-039 — Page text extracted twice per page (`get_all_text` + `get_sentences` both call `get_page_text`)
+
+> Note: originally logged as ISSUE-034; renumbered to ISSUE-039 after merging a
+> concurrent round that had already published different issues as 032–036.
+
+**Status**: VALIDATED ✅
+**Severity**: LOW
+
+### Discovery
+- **File**: `src/app.py` — `_update_page_display` lines 261-262; `src/pdf_reader.py` — `get_all_text` line 77, `get_sentences` line 67 (both call `get_page_text`)
+- **Description**: `_update_page_display` calls `text = self._pdf.get_all_text(self._current_page)` (line 261) and then `self._sentences = self._pdf.get_sentences(self._current_page)` (line 262). `get_all_text` calls `get_page_text`, and `get_sentences` also calls `get_page_text` internally (`pdf_reader.py` line 67). So every page load runs PyMuPDF `page.get_text("text")` and the `re.sub` whitespace normalization twice for the identical page. `_restore_bookmark` does the same double extraction (lines 632-633). The two calls always operate on the same page index, so the second extraction is pure redundant work.
+- **Root Cause**: `get_all_text` and `get_sentences` independently re-extract instead of sharing a single extraction result.
+- **Impact**: Doubled per-page extraction cost. Negligible for simple text pages, but noticeable UI lag on navigation for heavy pages (dense vector text, large tables) in big PDFs. Correctness is unaffected — purely an efficiency issue.
+- **Reproduction**: Open a large PDF with text-heavy pages and step through pages; extraction time per navigation is ~2x what a single extraction would cost.
+- **Fix Suggestion**: Extract once and reuse: e.g. add a `PDFReader.get_text_and_sentences(page_index)` returning both, or have the app call `get_all_text` once and derive sentences from that string (expose a `split_sentences(text)` helper). A tiny per-page cache keyed on `page_index` in `PDFReader` would also eliminate the duplication without changing call sites.
+- **Logging Added**: None (pure efficiency; existing `_update_page_display` DEBUG log already reports `text_len`).
+- **Date Found**: 2026-07-11
+
+### Fix
+- **Date**: 2026-07-11
+- **Changes**: Implemented the primary suggestion. `src/pdf_reader.py`: factored the sentence-splitting regex logic out of `get_sentences` into a new `_split_sentences(text)` static helper, and added `get_text_and_sentences(page_index)` which calls `get_page_text` exactly once and returns `(text, self._split_sentences(text))`. `get_all_text` and `get_sentences` are left unchanged (still call `get_page_text` independently) so any other/future single-purpose caller is unaffected. `src/app.py`: `_update_page_display` now does `text, self._sentences = self._pdf.get_text_and_sentences(self._current_page)` instead of two separate calls; `_restore_bookmark`'s page-jump branch does the same. Both call sites now run PyMuPDF extraction + whitespace normalization once per page load instead of twice. No `Depends On` — independent of ISSUE-037/038.
+
+### Validation
+- **Date**: 2026-07-11
+- **Method**: Tests + code inspection
+- **Tests**: `tests/test_issue_validations.py` — `TestIssue039SinglePageExtraction`: test_get_text_and_sentences_exists, test_get_text_and_sentences_extracts_page_exactly_once, test_get_text_and_sentences_matches_separate_calls, test_get_text_and_sentences_empty_page, test_get_text_and_sentences_out_of_range_page, test_update_page_display_uses_combined_extraction, test_restore_bookmark_uses_combined_extraction, test_app_update_page_display_calls_pdf_exactly_once (8 tests)
+- **Results**: 8 passed, 0 failed
+  - ✅ test_get_text_and_sentences_exists
+  - ✅ test_get_text_and_sentences_extracts_page_exactly_once — PyMuPDF `page.get_text` mock call_count == 1 for one `get_text_and_sentences(0)` call
+  - ✅ test_get_text_and_sentences_matches_separate_calls — combined result byte-for-byte equal to the pre-existing `get_all_text` + `get_sentences` pair (no behavior change)
+  - ✅ test_get_text_and_sentences_empty_page
+  - ✅ test_get_text_and_sentences_out_of_range_page — out-of-range index short-circuits before touching PyMuPDF at all
+  - ✅ test_update_page_display_uses_combined_extraction — source contains `get_text_and_sentences`; comment-stripped source contains neither `get_all_text(` nor `self._pdf.get_sentences(` (initial version of this test false-positived on the fix's own explanatory comment — same false-positive class as ISSUE-003/037 — fixed by stripping comments before asserting)
+  - ✅ test_restore_bookmark_uses_combined_extraction — same check for the page-jump branch
+  - ✅ test_app_update_page_display_calls_pdf_exactly_once — behavioral: `app._pdf.get_all_text`/`get_sentences` wired to raise `AssertionError` if called; `_update_page_display()` runs clean and calls `get_text_and_sentences(0)` exactly once
+- **Inspection**: `PDFReader.get_text_and_sentences` (pdf_reader.py lines 83-95) calls `get_page_text` exactly once and derives both return values from it via the new `_split_sentences` static helper (lines 65-72), which is byte-identical logic to what `get_sentences` used inline before. `get_all_text` and `get_sentences` are untouched, confirming the fixer's stated non-goal (existing single-purpose callers unaffected). `_update_page_display` (app.py line 314) and `_restore_bookmark`'s page-jump branch (line 692) both call `get_text_and_sentences` instead of the old two-call pattern.
+- **Verdict**: Fix is confirmed correct and complete. Both call sites now extract each page exactly once; results are unchanged from the pre-fix behavior.
 - **New Issues**: None
 
 ---

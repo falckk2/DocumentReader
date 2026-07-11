@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import tempfile
+import threading
 import tkinter as tk
 import tkinter.filedialog as fd
 import tkinter.messagebox as mb
@@ -55,6 +56,20 @@ class DocumentReaderApp(ctk.CTk):
         # threads.
         self._sentence_done_event = "<<SentenceDone>>"
 
+        # ISSUE-037 fix: same event_generate pattern for the VoiceManager
+        # background thread's load-complete callback. _voices_load_result
+        # is written on the background thread and read once on the GUI
+        # thread by the bound handler, so it never needs a lock: the event
+        # is only ever generated after the value is fully assigned, and
+        # event_generate(when="tail") queues the handler after that write
+        # happens-before it on the same thread.
+        self._voices_loaded_event = "<<VoicesLoaded>>"
+        self._voices_load_result = None
+
+        # ISSUE-038 fix: Play must stay disabled until voice discovery has
+        # actually finished, even if a PDF is already open.
+        self._voices_ready = False
+
         # ISSUE-005 fix: track the text-widget index where the last highlight
         # ended so the next search starts there, avoiding mis-highlighting
         # repeated phrases that appear earlier on the page.
@@ -64,6 +79,8 @@ class DocumentReaderApp(ctk.CTk):
         # ISSUE-003 fix: bind the virtual event on the GUI thread after the
         # window exists so event_generate from background threads is safe.
         self.bind(self._sentence_done_event, self._on_sentence_done_event)
+        # ISSUE-037 fix: same reasoning for the voice-load-complete event.
+        self.bind(self._voices_loaded_event, self._on_voices_loaded_event)
         self._load_voices()
 
     # ------------------------------------------------------------------
@@ -210,27 +227,54 @@ class DocumentReaderApp(ctk.CTk):
             # NOTE: this callback runs on the VoiceManager background thread.
             # ISSUE-014 fix: wrap in try/except so failures here do not
             # silently leave the UI stuck on "Loading voices…" forever.
+            # ISSUE-037 fix: this used to call self.after() directly from
+            # this background thread, which is not thread-safe for Tk/
+            # customtkinter. Instead, stash the outcome on an instance
+            # attribute and marshal to the GUI thread with event_generate
+            # (the only thread-safe Tk call from a non-GUI thread) — the
+            # same pattern used by _on_sentence_done for ISSUE-003. The
+            # actual widget updates happen in _on_voices_loaded_event on
+            # the GUI thread.
             try:
                 log.debug("Voice load callback fired with %d voices", len(voices))
                 if not voices:
                     log.warning("No voices were discovered (offline + online both empty)")
-                    self.after(0, lambda: self._set_status("No voices found"))
-                    return
-                display = [str(v) for v in voices]
-                default = self._voices.get_default_voice()
-                default_str = str(default) if default else display[0]
-
-                def update():
-                    self._voice_menu.configure(values=display)
-                    self._voice_var.set(default_str)
-                    self._set_status(f"{len(voices)} voices loaded")
-
-                self.after(0, update)
+                    self._voices_load_result = {"status": "No voices found"}
+                else:
+                    display = [str(v) for v in voices]
+                    default = self._voices.get_default_voice()
+                    default_str = str(default) if default else display[0]
+                    self._voices_load_result = {
+                        "display": display,
+                        "default_str": default_str,
+                        "status": f"{len(voices)} voices loaded",
+                    }
             except Exception:
                 log.exception("Unexpected error in voice-load callback; UI may be stuck")
-                self.after(0, lambda: self._set_status("Error loading voices"))
+                self._voices_load_result = {"status": "Error loading voices"}
+            try:
+                self.event_generate(self._voices_loaded_event, when="tail")
+            except Exception:
+                # Window may be closing; ignore
+                pass
 
         self._voices.load(on_done=on_done)
+
+    def _on_voices_loaded_event(self, _event=None):
+        # Runs on the GUI thread in response to <<VoicesLoaded>>.
+        result = self._voices_load_result
+        if not result:
+            return
+        self._set_status(result.get("status", ""))
+        if "display" in result:
+            self._voice_menu.configure(values=result["display"])
+            self._voice_var.set(result["default_str"])
+            # ISSUE-038 fix: voices are now actually usable — enable Play,
+            # but only if a PDF is already open (mirrors the gating in
+            # _open_pdf for the reverse ordering).
+            self._voices_ready = True
+            if self._pdf.is_open:
+                self._play_btn.configure(state="normal")
 
     # ------------------------------------------------------------------
     # PDF handling
@@ -259,12 +303,21 @@ class DocumentReaderApp(ctk.CTk):
         self._set_status(f"{count} page(s)")
         self._update_page_display()
         self._update_nav_buttons()
-        self._play_btn.configure(state="normal")
+        # ISSUE-038 fix: only enable Play once voice discovery has actually
+        # finished. If a PDF opens before _load_voices' async callback
+        # fires, the dropdown still holds the "Loading voices…" placeholder,
+        # which is not a resolvable Voice — pressing Play would silently
+        # fail with "No voice selected." and stop. _on_voices_loaded_event
+        # enables Play (if a PDF is open) once voices actually arrive.
+        if self._voices_ready:
+            self._play_btn.configure(state="normal")
         self._restore_bookmark(path)
 
     def _update_page_display(self):
-        text = self._pdf.get_all_text(self._current_page)
-        self._sentences = self._pdf.get_sentences(self._current_page)
+        # ISSUE-039 fix: extract page text once and derive sentences from
+        # it, instead of get_all_text() and get_sentences() each separately
+        # re-running PyMuPDF extraction for the same page.
+        text, self._sentences = self._pdf.get_text_and_sentences(self._current_page)
         self._sentence_idx = 0
         # ISSUE-005 fix: reset search start for highlight tracking on new page.
         self._highlight_search_start = "1.0"
@@ -388,7 +441,14 @@ class DocumentReaderApp(ctk.CTk):
         self._tts.stop()
         self._sentence_idx = 0
         self._clear_highlight()
-        self._play_btn.configure(state="normal" if self._pdf.is_open else "disabled", text="▶  Play")
+        # ISSUE-038 fix: only re-enable Play if voices are actually usable —
+        # _stop() runs at the start of _open_pdf() while a *previous* PDF
+        # may still be open, so gating on self._pdf.is_open alone could
+        # re-enable Play during the async voice-load window.
+        self._play_btn.configure(
+            state="normal" if (self._pdf.is_open and self._voices_ready) else "disabled",
+            text="▶  Play",
+        )
         self._pause_btn.configure(state="disabled")
         self._stop_btn.configure(state="disabled")
 
@@ -653,8 +713,8 @@ class DocumentReaderApp(ctk.CTk):
             self._current_page = page
             # Only reload page text if jumping to a different page
             if page != 0:
-                self._sentences = self._pdf.get_sentences(self._current_page)
-                text = self._pdf.get_all_text(self._current_page)
+                # ISSUE-039 fix: single extraction shared for text + sentences.
+                text, self._sentences = self._pdf.get_text_and_sentences(self._current_page)
                 self._text_box.configure(state="normal")
                 self._text_box.delete("1.0", "end")
                 self._text_box.insert("end", text if text else "(No text found on this page)")
