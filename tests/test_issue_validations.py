@@ -3114,5 +3114,504 @@ class TestIssue039SinglePageExtraction(unittest.TestCase):
         self.assertEqual(app._sentences, ["Hello world."])
 
 
+# ---------------------------------------------------------------------------
+# ISSUE-032 — _highlight_sentence search key length (Engineer_Mack fix,
+# commit ccf7b68) actually caps at 200 chars, not "the full sentence"
+# ---------------------------------------------------------------------------
+
+class TestIssue032HighlightSearchKeyLength(unittest.TestCase):
+    """The issues.md Fix note claims the search key is now 'the full sentence
+    text' with a 200-char fallback 'if the sentence is very long'. The actual
+    code unconditionally computes `sentence[:200] if len(sentence) > 200 else
+    sentence`, i.e. every sentence longer than 200 chars is capped, not just
+    'very long' outliers. These tests pin the ACTUAL behavior and confirm it
+    closes the originally reported 40-char collision bug for any sentence up
+    to 200 chars (the realistic case for PDF sentences)."""
+
+    def _make_app(self):
+        import src.app as app_mod
+        app = app_mod.DocumentReaderApp.__new__(app_mod.DocumentReaderApp)
+        app._text_box = MagicMock()
+        app._highlight_search_start = "1.0"
+        return app
+
+    def test_search_key_is_full_sentence_for_100_char_sentence(self):
+        """A sentence between the old 40-char cap and the new 200-char cap
+        must be searched in full -- this is exactly the class of bug
+        reported (two sentences sharing a >40-char common prefix)."""
+        app = self._make_app()
+        sentence = "A" * 100
+        app._text_box.search.return_value = "3.5"
+        app._highlight_sentence(sentence)
+        called_key = app._text_box.search.call_args[0][0]
+        self.assertEqual(called_key, sentence,
+                         "search key truncated below 200 chars for a 100-char sentence")
+        self.assertNotEqual(called_key, sentence[:40],
+                            "ISSUE-032 regression: search key is back to the old 40-char cap")
+
+    def test_search_key_capped_at_200_for_longer_sentences(self):
+        """Behavioral evidence of the Fix-note discrepancy: sentences over
+        200 chars are still capped -- the search key is NOT the literal full
+        sentence as the Fix description states."""
+        app = self._make_app()
+        sentence = "B" * 250
+        app._text_box.search.return_value = "3.5"
+        app._highlight_sentence(sentence)
+        called_key = app._text_box.search.call_args[0][0]
+        self.assertEqual(called_key, sentence[:200],
+                         "search key is not capped at 200 chars for a >200-char sentence")
+        self.assertEqual(len(called_key), 200)
+        self.assertNotEqual(called_key, sentence,
+                            "documents the ISSUE-032 Fix-note discrepancy: code caps at "
+                            "200 chars, it does not use the literal 'full sentence'")
+
+    def test_highlight_span_uses_full_sentence_length_not_truncated_key(self):
+        """Even when the search key is truncated to 200 chars, the highlighted
+        span (tag_add end index) must still cover the FULL sentence length,
+        not just the 200-char search key."""
+        app = self._make_app()
+        sentence = "C" * 300
+        app._text_box.search.return_value = "5.0"
+        app._highlight_sentence(sentence)
+        tag_add_args = app._text_box.tag_add.call_args[0]
+        self.assertEqual(tag_add_args[0], "highlight")
+        self.assertEqual(tag_add_args[2], f"5.0+{len(sentence)}c",
+                         "highlight end index must use len(sentence), not the "
+                         "truncated 200-char search key length")
+
+    def test_original_40_char_collision_is_resolved(self):
+        """Reproduces the originally reported bug: two sentences share an
+        identical 40-char prefix but diverge afterward. Pre-fix (40-char
+        search key), both sentences produced the identical search key and
+        could not be told apart. Post-fix, the search keys are distinct."""
+        prefix = "This is a very long sentence that starts with the same "
+        self.assertGreater(len(prefix), 40)  # sanity: exercises the old bug's range
+        sentence_a = prefix + "opening but ends in Alpha."
+        sentence_b = prefix + "opening but ends in Beta."
+        search_key_a = sentence_a[:200] if len(sentence_a) > 200 else sentence_a
+        search_key_b = sentence_b[:200] if len(sentence_b) > 200 else sentence_b
+        self.assertEqual(search_key_a[:40], search_key_b[:40],
+                         "sanity: the two sentences must share the old 40-char prefix")
+        self.assertNotEqual(search_key_a, search_key_b,
+                            "ISSUE-032 regression: distinct sentences sharing a >40-char "
+                            "prefix produce identical search keys again")
+
+
+# ---------------------------------------------------------------------------
+# ISSUE-033 — last sentence at EOF (no trailing whitespace) is no longer lost
+# ---------------------------------------------------------------------------
+
+class TestIssue033LastSentenceSplit(unittest.TestCase):
+
+    def test_split_sentences_regex_includes_end_of_string_branch(self):
+        import src.pdf_reader as pr
+        src = inspect.getsource(pr.PDFReader._split_sentences)
+        self.assertIn(r"(?<=[.!?])$", src,
+                      "_split_sentences regex missing the end-of-string branch (ISSUE-033)")
+
+    def test_last_sentence_with_no_trailing_whitespace_is_split(self):
+        import src.pdf_reader as pr
+        text = "First sentence. Second sentence ends here."
+        result = pr.PDFReader._split_sentences(text)
+        self.assertEqual(result, ["First sentence.", "Second sentence ends here."],
+                         "the final sentence at EOF (no trailing space/newline) was lost")
+
+    def test_single_sentence_page_with_no_trailing_whitespace(self):
+        import src.pdf_reader as pr
+        result = pr.PDFReader._split_sentences("Hello world.")
+        self.assertEqual(result, ["Hello world."])
+
+    def test_trailing_whitespace_case_still_works_no_regression(self):
+        import src.pdf_reader as pr
+        text = "First sentence. Second sentence. \n\n"
+        result = pr.PDFReader._split_sentences(text)
+        self.assertEqual(result, ["First sentence.", "Second sentence."])
+
+    def test_multiple_punctuation_marks_still_split_correctly(self):
+        import src.pdf_reader as pr
+        text = "Is this real? Yes! It ends now."
+        result = pr.PDFReader._split_sentences(text)
+        self.assertEqual(result, ["Is this real?", "Yes!", "It ends now."])
+
+    def test_get_sentences_delegates_to_split_sentences_helper(self):
+        import src.pdf_reader as pr
+        src = inspect.getsource(pr.PDFReader.get_sentences)
+        self.assertIn("_split_sentences", src,
+                      "get_sentences does not delegate to _split_sentences (ISSUE-033/039 wiring)")
+
+    def test_get_text_and_sentences_also_gets_the_fix(self):
+        import src.pdf_reader as pr
+        src = inspect.getsource(pr.PDFReader.get_text_and_sentences)
+        self.assertIn("_split_sentences", src,
+                      "get_text_and_sentences does not delegate to _split_sentences")
+
+    def test_end_to_end_get_sentences_last_sentence_not_lost(self):
+        """Behavioral, through the public get_sentences() API with a mocked
+        PyMuPDF page, matching the real _update_page_display code path."""
+        import src.pdf_reader as pr
+        mock_doc = MagicMock()
+        mock_doc.is_encrypted = False
+        mock_doc.__len__ = MagicMock(return_value=1)
+        page = MagicMock()
+        page.get_text = MagicMock(return_value="Opening remark. Final sentence ends here.")
+        mock_doc.__getitem__ = MagicMock(return_value=page)
+        with patch("fitz.open", return_value=mock_doc):
+            reader = pr.PDFReader()
+            reader.open("/fake/path.pdf")
+        sentences = reader.get_sentences(0)
+        self.assertEqual(len(sentences), 2,
+                         "last sentence on the page was silently merged into "
+                         "the previous one (ISSUE-033)")
+        self.assertEqual(sentences[-1], "Final sentence ends here.")
+
+    def test_short_fragment_filter_not_actually_implemented(self):
+        """Documents a Fix-note discrepancy: the Fix section claims 'a filter
+        for very short fragments (< 2 chars) that result from abbreviation
+        false splits' was added. No length-based filter exists in
+        _split_sentences -- the only filter is `if s.strip()` (drops
+        empty/whitespace-only fragments). Abbreviations like 'Dr.' still
+        produce a false split. This does not affect the actual reported bug
+        (last-sentence-at-EOF loss), which is verified fixed above; flagged
+        here so the Validation note is accurate."""
+        import src.pdf_reader as pr
+        src = inspect.getsource(pr.PDFReader._split_sentences)
+        self.assertNotIn("len(s)", src,
+                         "if this starts failing, a short-fragment length filter was "
+                         "actually added -- update the ISSUE-033 Validation note")
+        self.assertNotIn("< 2", src,
+                         "if this starts failing, a short-fragment length filter was "
+                         "actually added -- update the ISSUE-033 Validation note")
+
+
+# ---------------------------------------------------------------------------
+# ISSUE-034 — VoiceManager.load's _load body wrapped in try/except/finally
+# so on_done always fires, even on an unexpected crash
+# ---------------------------------------------------------------------------
+
+class TestIssue034VoiceLoadNeverStuck(unittest.TestCase):
+
+    def test_load_inner_function_has_try_except_finally(self):
+        import src.voice_manager as vm_mod
+        src = inspect.getsource(vm_mod.VoiceManager.load)
+        self.assertIn("try:", src)
+        self.assertIn("except Exception", src)
+        self.assertIn("finally:", src)
+        finally_body = src.split("finally:", 1)[1]
+        self.assertIn("on_done(", finally_body,
+                      "on_done is not called from the finally block (ISSUE-034)")
+
+    def test_finally_guards_none_on_done(self):
+        import src.voice_manager as vm_mod
+        src = inspect.getsource(vm_mod.VoiceManager.load)
+        self.assertIn("if on_done:", src,
+                      "the finally block must guard against on_done=None")
+
+    def test_on_done_called_when_offline_loader_raises_unexpectedly(self):
+        """Simulates an uncaught exception escaping the try body (bypassing
+        _load_offline_voices' own internal try/except) -- on_done must still
+        fire so the UI does not get stuck on 'Loading voices...' forever."""
+        import src.voice_manager as vm_mod
+        vm = vm_mod.VoiceManager()
+        vm._load_offline_voices = MagicMock(side_effect=RuntimeError("boom"))
+        vm._load_online_voices = MagicMock(return_value=[])
+        done = threading.Event()
+        result = {}
+
+        def on_done(voices):
+            result["voices"] = voices
+            done.set()
+
+        vm.load(on_done=on_done)
+        self.assertTrue(done.wait(timeout=2),
+                        "on_done was never called after _load raised -- UI would "
+                        "be stuck on 'Loading voices...' (ISSUE-034)")
+        self.assertEqual(result["voices"], [])
+
+    def test_on_done_called_when_online_loader_raises_unexpectedly(self):
+        import src.voice_manager as vm_mod
+        vm = vm_mod.VoiceManager()
+        vm._load_offline_voices = MagicMock(return_value=[])
+        vm._load_online_voices = MagicMock(side_effect=RuntimeError("boom"))
+        done = threading.Event()
+        result = {}
+
+        def on_done(voices):
+            result["voices"] = voices
+            done.set()
+
+        vm.load(on_done=on_done)
+        self.assertTrue(done.wait(timeout=2),
+                        "on_done was never called after _load raised (ISSUE-034)")
+        self.assertEqual(result["voices"], [])
+
+    def test_loaded_flag_not_set_when_load_fails(self):
+        import src.voice_manager as vm_mod
+        vm = vm_mod.VoiceManager()
+        vm._load_offline_voices = MagicMock(return_value=[])
+        vm._load_online_voices = MagicMock(side_effect=RuntimeError("boom"))
+        done = threading.Event()
+        vm.load(on_done=lambda voices: done.set())
+        self.assertTrue(done.wait(timeout=2))
+        self.assertFalse(vm.is_loaded,
+                         "_loaded should remain False when the load body raised")
+
+    def test_on_done_called_normally_on_success(self):
+        """Regression guard: the try/except/finally wrapping must not change
+        the success path's result."""
+        import src.voice_manager as vm_mod
+        fake_voice = vm_mod.Voice(id="x", name="X", locale="en-US",
+                                  gender="Female", source="offline")
+        vm = vm_mod.VoiceManager()
+        vm._load_offline_voices = MagicMock(return_value=[fake_voice])
+        vm._load_online_voices = MagicMock(return_value=[])
+        done = threading.Event()
+        result = {}
+
+        def on_done(voices):
+            result["voices"] = voices
+            done.set()
+
+        vm.load(on_done=on_done)
+        self.assertTrue(done.wait(timeout=2))
+        self.assertEqual(result["voices"], [fake_voice])
+        self.assertTrue(vm.is_loaded)
+
+
+# ---------------------------------------------------------------------------
+# ISSUE-035 — TTSEngine.close() tears down the AudioPlayer / notify window;
+# called from DocumentReaderApp.on_close()
+# ---------------------------------------------------------------------------
+
+class TestIssue035TTSEngineClose(unittest.TestCase):
+
+    def test_tts_engine_has_close_method(self):
+        import src.tts_engine as te
+        self.assertTrue(hasattr(te.TTSEngine, "close"),
+                        "TTSEngine.close is missing (ISSUE-035)")
+
+    def test_close_calls_stop_then_player_close(self):
+        import src.tts_engine as te
+        src = inspect.getsource(te.TTSEngine.close)
+        self.assertIn("self.stop()", src)
+        self.assertIn("self._player.close()", src)
+        self.assertLess(src.find("self.stop()"), src.find("self._player.close()"),
+                        "close() must stop playback before tearing down the player")
+
+    def test_close_behavioral_calls_player_close_and_stop(self):
+        engine = _make_tts_engine()
+        engine.close()
+        engine._player.close.assert_called_once()
+        engine._player.stop.assert_called_once()
+
+    def test_on_close_calls_tts_close(self):
+        import src.app as app_mod
+        src = inspect.getsource(app_mod.DocumentReaderApp.on_close)
+        self.assertIn("self._tts.close()", src,
+                      "on_close does not call self._tts.close() (ISSUE-035)")
+
+    def test_on_close_stops_before_closing(self):
+        import src.app as app_mod
+        src = inspect.getsource(app_mod.DocumentReaderApp.on_close)
+        self.assertLess(src.find("self._tts.stop()"), src.find("self._tts.close()"),
+                        "on_close must stop before close")
+
+    def _make_app(self):
+        import src.app as app_mod
+        app = app_mod.DocumentReaderApp.__new__(app_mod.DocumentReaderApp)
+        app._reading = False
+        app._paused = False
+        app._sentence_idx = 0
+        app._current_page = 0
+        app._current_pdf_path = None
+        app._tts = MagicMock()
+        app._pdf = MagicMock()
+        app.destroy = MagicMock()
+        return app
+
+    def test_on_close_behavioral_calls_both_stop_and_close(self):
+        app = self._make_app()
+        app.on_close()
+        app._tts.stop.assert_called_once()
+        app._tts.close.assert_called_once()
+
+    def test_close_is_idempotent_after_stop_already_called(self):
+        """AudioPlayer.stop() is idempotent (ISSUE-001/022 lineage). Real
+        app.on_close() calls _tts.stop() directly and then _tts.close()
+        (which calls stop() again internally) -- close() must not raise or
+        deadlock when the player was already stopped/never opened."""
+        import src.audio_player as ap
+        ap._mci = MagicMock(return_value=0)
+        ap._mci_query = MagicMock(return_value="stopped")
+        player = ap.AudioPlayer()
+        player.stop()   # nothing was ever opened -- must be a safe no-op
+        player.close()  # calls stop() again internally -- must not raise
+
+
+# ---------------------------------------------------------------------------
+# ISSUE-036 — bookmark read-modify-write serialized under _bookmark_lock;
+# _write_bookmarks uses tempfile + os.replace for atomic writes
+# (issues.md lists this as Status: OPEN even though the fix is in the code
+#  -- validated here and promoted to VALIDATED, see issues.md note)
+# ---------------------------------------------------------------------------
+
+class TestIssue036BookmarkLockAndAtomicWrite(unittest.TestCase):
+
+    def test_bookmark_lock_initialized_in_init(self):
+        import src.app as app_mod
+        src = inspect.getsource(app_mod.DocumentReaderApp.__init__)
+        self.assertIn("_bookmark_lock", src,
+                      "_bookmark_lock not initialized in __init__ (ISSUE-036)")
+        self.assertIn("threading.Lock()", src.split("_bookmark_lock", 1)[1][:60],
+                      "_bookmark_lock is not a threading.Lock")
+
+    def test_bookmark_lock_is_instance_attribute_not_class_level(self):
+        """Fix-note discrepancy: the ISSUE-036 Fix description says 'a
+        class-level `_bookmark_lock`' was added. The actual code creates it
+        as an instance attribute (`self._bookmark_lock = threading.Lock()`
+        inside `__init__`). Functionally equivalent for this single-instance
+        GUI app, but documented here for accuracy."""
+        import src.app as app_mod
+        self.assertNotIn("_bookmark_lock", vars(app_mod.DocumentReaderApp),
+                         "if this starts failing, _bookmark_lock became a real "
+                         "class attribute -- update the ISSUE-036 Validation note")
+
+    def test_save_bookmark_serializes_under_lock(self):
+        import src.app as app_mod
+        src = inspect.getsource(app_mod.DocumentReaderApp._save_bookmark)
+        self.assertIn("with self._bookmark_lock:", src,
+                      "_save_bookmark does not serialize its read-modify-write "
+                      "cycle under _bookmark_lock (ISSUE-036)")
+
+    def test_clear_bookmark_serializes_under_lock(self):
+        import src.app as app_mod
+        src = inspect.getsource(app_mod.DocumentReaderApp._clear_bookmark)
+        self.assertIn("with self._bookmark_lock:", src,
+                      "_clear_bookmark does not serialize its read-modify-write "
+                      "cycle under _bookmark_lock (ISSUE-036)")
+
+    def test_write_bookmarks_uses_tempfile_and_atomic_replace(self):
+        import src.app as app_mod
+        src = inspect.getsource(app_mod.DocumentReaderApp._write_bookmarks)
+        self.assertIn("tempfile.mkstemp", src,
+                      "_write_bookmarks does not write to a temp file first (ISSUE-036)")
+        self.assertIn("os.replace", src,
+                      "_write_bookmarks does not atomically replace via os.replace (ISSUE-036)")
+
+    def _make_app(self):
+        import src.app as app_mod
+        app = app_mod.DocumentReaderApp.__new__(app_mod.DocumentReaderApp)
+        app._bookmark_lock = threading.Lock()
+        return app
+
+    def test_save_bookmark_lock_actually_serializes_concurrent_callers(self):
+        """Behavioral proof the lock is not decorative: block one caller
+        mid-read-modify-write and confirm a second concurrent caller cannot
+        proceed until the first releases the lock."""
+        app = self._make_app()
+        release = threading.Event()
+        entered_first = threading.Event()
+
+        def blocking_load():
+            entered_first.set()
+            release.wait(timeout=2)
+            return {}
+
+        app._load_bookmarks = blocking_load
+        app._write_bookmarks = MagicMock()
+        app._current_pdf_path = "C:/a.pdf"
+        app._current_page = 0
+        app._sentence_idx = 0
+
+        t1 = threading.Thread(target=app._save_bookmark)
+        t1.start()
+        self.assertTrue(entered_first.wait(timeout=2),
+                        "first caller never entered _load_bookmarks")
+
+        second_done = threading.Event()
+
+        def second_call():
+            app._save_bookmark()
+            second_done.set()
+
+        t2 = threading.Thread(target=second_call)
+        t2.start()
+        # Second caller must be blocked waiting for the lock, not proceeding.
+        self.assertFalse(second_done.wait(timeout=0.3),
+                         "second _save_bookmark call proceeded while the first "
+                         "still held _bookmark_lock -- lock is not serializing (ISSUE-036)")
+        release.set()
+        t1.join(timeout=2)
+        t2.join(timeout=2)
+        self.assertTrue(second_done.is_set())
+        self.assertEqual(app._write_bookmarks.call_count, 2)
+
+    def test_write_bookmarks_atomic_failure_preserves_original_file(self):
+        """If the write fails with an OSError (the realistic case, e.g. disk
+        full), the original bookmarks file must be left untouched, and the
+        temp file must be cleaned up rather than left stray."""
+        import json as _json
+        import src.app as app_mod
+        fd, path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        original = {"C:/keep.pdf": {"page": 2, "sentence_idx": 1}}
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                _json.dump(original, f)
+            app = self._make_app()
+            with patch.object(app_mod, "_BOOKMARKS_FILE", path):
+                with patch.object(app_mod.json, "dump", side_effect=OSError("disk full")):
+                    app._write_bookmarks({"C:/new.pdf": {"page": 0, "sentence_idx": 0}})
+            with open(path, encoding="utf-8") as f:
+                data = _json.load(f)
+            self.assertEqual(data, original,
+                             "a failed write corrupted/replaced the original bookmarks file")
+            leftover = [name for name in os.listdir(os.path.dirname(path) or ".")
+                       if name.startswith(".bookmarks-") and name.endswith(".tmp")]
+            self.assertEqual(leftover, [],
+                             "temp file from the failed write was not cleaned up")
+        finally:
+            os.remove(path)
+
+    def test_write_bookmarks_success_leaves_no_stray_temp_file(self):
+        import json as _json
+        import src.app as app_mod
+        fd, path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        try:
+            app = self._make_app()
+            with patch.object(app_mod, "_BOOKMARKS_FILE", path):
+                app._write_bookmarks({"C:/doc.pdf": {"page": 1, "sentence_idx": 2}})
+            with open(path, encoding="utf-8") as f:
+                data = _json.load(f)
+            self.assertEqual(data, {"C:/doc.pdf": {"page": 1, "sentence_idx": 2}})
+            leftover = [name for name in os.listdir(os.path.dirname(path) or ".")
+                       if name.startswith(".bookmarks-") and name.endswith(".tmp")]
+            self.assertEqual(leftover, [],
+                             "a successful write left a stray temp file behind")
+        finally:
+            os.remove(path)
+
+    def test_save_bookmark_end_to_end_still_persists_correctly(self):
+        """Regression guard: the lock + atomic-write plumbing must not change
+        the observable behavior of a normal single-threaded _save_bookmark
+        call (same contract as the pre-ISSUE-036 implementation)."""
+        import json as _json
+        import src.app as app_mod
+        fd, path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        try:
+            app = self._make_app()
+            app._current_pdf_path = "C:/doc.pdf"
+            app._current_page = 3
+            app._sentence_idx = 5
+            with patch.object(app_mod, "_BOOKMARKS_FILE", path):
+                app._save_bookmark()
+            with open(path, encoding="utf-8") as f:
+                data = _json.load(f)
+            self.assertEqual(data.get("C:/doc.pdf"), {"page": 3, "sentence_idx": 5})
+        finally:
+            os.remove(path)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

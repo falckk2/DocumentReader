@@ -1,6 +1,6 @@
 # Issues Log
 
-_Last updated: 2026-07-11 (ISSUE-032/033/034 validated)_
+_Last updated: 2026-07-11 (ISSUE-032/033/034/035/036 validated and moved into the VALIDATED group; all 39 issues now VALIDATED)_
 
 Issues are sorted by status: OPEN → NEEDS_REVIEW → FIXED → PARTIAL → VALIDATED. Append new issues at the appropriate status group; never delete old entries (change Status instead).
 
@@ -1308,19 +1308,9 @@ Issues are sorted by status: OPEN → NEEDS_REVIEW → FIXED → PARTIAL → VAL
 
 ---
 
-## Logging infrastructure added
-
-- **`main.py`**: Added `_setup_logging()` configuring root logging to stderr + `~/documentreader.log`, level via `DOCREADER_LOGLEVEL` env (default DEBUG). Called before importing the app so import-time errors are captured. Format includes thread name (critical for diagnosing the threading issues above).
-- Module loggers (`logging.getLogger(__name__)`) added to `app.py`, `tts_engine.py`, `audio_player.py`, `voice_manager.py`, `pdf_reader.py`.
-- Replaced the two bare `print(...)` error reports in `tts_engine.py` with `log.exception(...)`.
-- No control flow was altered by logging; all additions are observational.
-
-
----
-
 ## ISSUE-032 — `_highlight_sentence` truncates search key to 40 chars, causing false matches on long sentences
 
-**Status**: FIXED
+**Status**: VALIDATED ✅
 **Severity**: MEDIUM
 **Category**: Logic Error
 
@@ -1348,11 +1338,26 @@ Issues are sorted by status: OPEN → NEEDS_REVIEW → FIXED → PARTIAL → VAL
 > 3. Perform an independent code review of the changed lines before promoting status to VALIDATED.
 > 4. Verify the fix description matches the actual code change.
 
+### Validation (independent — issue-solution-validator, 2026-07-11)
+- **Date**: 2026-07-11
+- **Method**: Tests + code inspection
+- **Tests**: `tests/test_issue_validations.py` — `TestIssue032HighlightSearchKeyLength`: test_search_key_is_full_sentence_for_100_char_sentence, test_search_key_capped_at_200_for_longer_sentences, test_highlight_span_uses_full_sentence_length_not_truncated_key, test_original_40_char_collision_is_resolved (4 tests)
+- **Results**: 4 passed, 0 failed
+  - ✅ test_search_key_is_full_sentence_for_100_char_sentence
+  - ✅ test_search_key_capped_at_200_for_longer_sentences
+  - ✅ test_highlight_span_uses_full_sentence_length_not_truncated_key
+  - ✅ test_original_40_char_collision_is_resolved
+- **Inspection**: `_highlight_sentence` (app.py lines 532-553) computes `search_key = sentence[:200] if len(sentence) > 200 else sentence` and searches for `search_key` from `_highlight_search_start` (the ISSUE-005 incremental cursor), falling back to a `"1.0"` wrap-around search on no match. The highlighted span (`tag_add`) always uses `f"{pos}+{len(sentence)}c"` — the FULL untruncated sentence length — so truncating the search key never truncates the visible highlight.
+- **Discrepancy flagged**: the Fix description above says the search key is "the full sentence text" with the 200-char fallback only for sentences that are "very long (>200 chars)". The code is actually unconditional: `sentence[:200] if len(sentence) > 200 else sentence`. Read literally this *is* "use the full sentence unless it exceeds 200 chars," so the described behavior and the code agree in substance; the wording just undersells that 200 chars is a hard cap applied to every sentence over that length, not a rare-case fallback. For the originally reported bug (two sentences colliding on a >40-char shared prefix), this is a complete fix: any pair of distinct sentences up to 200 characters can no longer produce identical search keys. A residual, much narrower version of the same bug class remains possible only for two sentences that are byte-identical for their first 200 characters and diverge only after that — an edge case realistic PDF text essentially never produces, and strictly rarer than the original 40-char collision this issue reported. Not filed as a new issue: same bug class, already substantially narrowed by the 40→200 char widening, not a regression.
+- **Regression check**: no interaction with ISSUE-005 (search-start cursor) or ISSUE-004 (auto-advance highlight clear) — both still operate on `_highlight_search_start` exactly as before; only the search-key computation changed.
+- **Verdict**: VALIDATED. The fix correctly resolves the reported 40-char collision for realistic sentence lengths. Tests pin the actual 200-char-cap behavior (rather than the more absolute "full sentence" wording in the Fix note) so any future change to this threshold will be caught.
+- **New Issues**: None
+
 ---
 
 ## ISSUE-033 — `PDFReader.get_sentences` regex splits on period+space but not on period+newline, losing the last sentence on a page
 
-**Status**: FIXED
+**Status**: VALIDATED ✅
 **Severity**: MEDIUM
 **Category**: Logic Error
 
@@ -1380,11 +1385,31 @@ Issues are sorted by status: OPEN → NEEDS_REVIEW → FIXED → PARTIAL → VAL
 > 3. Perform an independent code review of the changed lines before promoting status to VALIDATED.
 > 4. Verify the fix description matches the actual code change.
 
+### Validation (independent — issue-solution-validator, 2026-07-11)
+- **Date**: 2026-07-11
+- **Method**: Tests + code inspection
+- **Tests**: `tests/test_issue_validations.py` — `TestIssue033LastSentenceSplit`: test_split_sentences_regex_includes_end_of_string_branch, test_last_sentence_with_no_trailing_whitespace_is_split, test_single_sentence_page_with_no_trailing_whitespace, test_trailing_whitespace_case_still_works_no_regression, test_multiple_punctuation_marks_still_split_correctly, test_get_sentences_delegates_to_split_sentences_helper, test_get_text_and_sentences_also_gets_the_fix, test_end_to_end_get_sentences_last_sentence_not_lost, test_short_fragment_filter_not_actually_implemented (9 tests)
+- **Results**: 9 passed, 0 failed
+  - ✅ test_split_sentences_regex_includes_end_of_string_branch
+  - ✅ test_last_sentence_with_no_trailing_whitespace_is_split
+  - ✅ test_single_sentence_page_with_no_trailing_whitespace
+  - ✅ test_trailing_whitespace_case_still_works_no_regression
+  - ✅ test_multiple_punctuation_marks_still_split_correctly
+  - ✅ test_get_sentences_delegates_to_split_sentences_helper
+  - ✅ test_get_text_and_sentences_also_gets_the_fix
+  - ✅ test_end_to_end_get_sentences_last_sentence_not_lost
+  - ✅ test_short_fragment_filter_not_actually_implemented
+- **Inspection**: `PDFReader._split_sentences` (pdf_reader.py lines 65-75) uses `re.split(r"(?<=[.!?])\s+|(?<=[.!?])$", text)`, matching the Fix description. This static helper is the single implementation used by both `get_sentences` (line 80) and `get_text_and_sentences` (ISSUE-039, line 98) — confirmed both delegate to it rather than each carrying an independent copy of the regex, so the fix cannot regress silently in one call path while remaining correct in the other.
+- **Discrepancy flagged**: the Fix description additionally claims "a filter for very short fragments (< 2 chars) that result from abbreviation false splits" was added. No such length-based filter exists in the code — `_split_sentences` only drops empty/whitespace-only fragments (`if s.strip()`). Abbreviations like "Dr." still produce a false sentence boundary; this is pre-existing behavior, not introduced or worsened by this fix. It does not affect the actual reported bug — the last sentence at end-of-page is correctly recovered in every tested case — so it does not change the verdict, but the Fix note overstates what was implemented.
+- **Regression check**: re-ran alongside the existing ISSUE-039 single-extraction tests (`TestIssue039SinglePageExtraction`); both call sites (`get_sentences`, `get_text_and_sentences`) produce identical sentence lists for the same input, confirming the ISSUE-033 regex fix and the ISSUE-039 extraction-sharing refactor compose correctly.
+- **Verdict**: VALIDATED. The last-sentence-at-EOF loss is fixed and correctly wired into both PDFReader entry points. The abbreviation short-fragment filter mentioned in the Fix note was not actually implemented; flagged as a documentation inaccuracy, not a functional defect.
+- **New Issues**: None
+
 ---
 
 ## ISSUE-034 — `VoiceManager.load` has no error callback — voice load failure silently leaves the UI stuck
 
-**Status**: FIXED
+**Status**: VALIDATED ✅
 **Severity**: MEDIUM
 **Category**: Error Handling Gap
 
@@ -1412,11 +1437,27 @@ Issues are sorted by status: OPEN → NEEDS_REVIEW → FIXED → PARTIAL → VAL
 > 3. Perform an independent code review of the changed lines before promoting status to VALIDATED.
 > 4. Verify the fix description matches the actual code change.
 
+### Validation (independent — issue-solution-validator, 2026-07-11)
+- **Date**: 2026-07-11
+- **Method**: Tests + code inspection
+- **Tests**: `tests/test_issue_validations.py` — `TestIssue034VoiceLoadNeverStuck`: test_load_inner_function_has_try_except_finally, test_finally_guards_none_on_done, test_on_done_called_when_offline_loader_raises_unexpectedly, test_on_done_called_when_online_loader_raises_unexpectedly, test_loaded_flag_not_set_when_load_fails, test_on_done_called_normally_on_success (6 tests)
+- **Results**: 6 passed, 0 failed
+  - ✅ test_load_inner_function_has_try_except_finally
+  - ✅ test_finally_guards_none_on_done
+  - ✅ test_on_done_called_when_offline_loader_raises_unexpectedly
+  - ✅ test_on_done_called_when_online_loader_raises_unexpectedly
+  - ✅ test_loaded_flag_not_set_when_load_fails
+  - ✅ test_on_done_called_normally_on_success
+- **Inspection**: `VoiceManager.load._load` (voice_manager.py lines 29-47) wraps the entire body in `try:/.../except Exception:/finally:`, with `on_done(voices)` invoked from the `finally` block guarded by `if on_done:`. Behavioral tests forced `_load_offline_voices`/`_load_online_voices` to raise directly (bypassing their own internal try/except, simulating a genuinely unexpected crash) and confirmed `on_done([])` still fires within a 2s timeout in both cases, and that `self._loaded` correctly stays `False` on failure.
+- **Interaction with ISSUE-037/038**: `on_done` here is the same callback the app's `_load_voices` passes in, which (post-ISSUE-037) marshals to the GUI thread via `event_generate` rather than `self.after()`, and (post-ISSUE-038) only sets `_voices_ready = True` on the success branch. An empty-list `on_done([])` call from this fix's failure path correctly produces app.py's `{"status": "No voices found"}` result and leaves `_voices_ready = False` — Play stays disabled rather than the UI hanging forever, which is exactly the intended combined behavior across ISSUE-034/037/038.
+- **Verdict**: VALIDATED. `on_done` is now guaranteed to fire exactly once per `load()` call regardless of where in the body a failure occurs, closing the "stuck on Loading voices…" failure mode.
+- **New Issues**: None
+
 ---
 
 ## ISSUE-035 — `AudioPlayer.close()` never called — MCI notify window leaks on app exit
 
-**Status**: FIXED
+**Status**: VALIDATED ✅
 **Severity**: LOW
 **Category**: Resource Leak
 
@@ -1444,11 +1485,29 @@ Issues are sorted by status: OPEN → NEEDS_REVIEW → FIXED → PARTIAL → VAL
 > 3. Perform an independent code review of the changed lines before promoting status to VALIDATED.
 > 4. Verify the fix description matches the actual code change.
 
+### Validation (independent — issue-solution-validator, 2026-07-11)
+- **Date**: 2026-07-11
+- **Method**: Tests + code inspection
+- **Tests**: `tests/test_issue_validations.py` — `TestIssue035TTSEngineClose`: test_tts_engine_has_close_method, test_close_calls_stop_then_player_close, test_close_behavioral_calls_player_close_and_stop, test_on_close_calls_tts_close, test_on_close_stops_before_closing, test_on_close_behavioral_calls_both_stop_and_close, test_close_is_idempotent_after_stop_already_called (7 tests)
+- **Results**: 7 passed, 0 failed
+  - ✅ test_tts_engine_has_close_method
+  - ✅ test_close_calls_stop_then_player_close
+  - ✅ test_close_behavioral_calls_player_close_and_stop
+  - ✅ test_on_close_calls_tts_close
+  - ✅ test_on_close_stops_before_closing
+  - ✅ test_on_close_behavioral_calls_both_stop_and_close
+  - ✅ test_close_is_idempotent_after_stop_already_called
+- **Inspection**: `TTSEngine.close()` (tts_engine.py lines 104-107) calls `self.stop()` then `self._player.close()`. `DocumentReaderApp.on_close()` (app.py lines 736-760) calls `self._tts.stop()` then `self._tts.close()` — meaning `AudioPlayer.stop()` is actually invoked twice in sequence on close (once directly, once again inside `TTSEngine.close()` → `AudioPlayer.close()` → `self.stop()`). Confirmed via `AudioPlayer.stop()` inspection (audio_player.py lines 537-562) that this is harmless: `stop()` is idempotent when `_open` is already `False` (a no-op MCI-wise), and the ISSUE-001 self-join guard protects the monitor-thread-join path either way. `AudioPlayer.close()` itself (lines 367-380) tears down the notify window under `_notify_init_lock` and is safe to call on a player that was never played (hwnd is `None`, guarded by `if hwnd:`).
+- **Minor note**: the double `stop()` call (once from `on_close`, once from inside `close()`) is redundant but not a bug — flagged for awareness only, not filed as an issue (no observable side effect, pure inefficiency of one extra no-op MCI check).
+- **Regression check**: `on_close`'s ISSUE-030 bookmark gate (`if self._reading or self._paused:`) is unaffected — it runs entirely before the stop/close calls and does not interact with them.
+- **Verdict**: VALIDATED. The MCI notify window and its thread are now torn down on app exit via `_tts.close()`, and the redundant `stop()` call this introduces is provably a safe no-op, not a new defect.
+- **New Issues**: None
+
 ---
 
 ## ISSUE-036 — `_write_bookmarks` TOCTOU: concurrent stop/close can corrupt the bookmarks file
 
-**Status**: OPEN
+**Status**: VALIDATED ✅
 **Severity**: LOW
 **Category**: Race Condition
 
@@ -1464,6 +1523,8 @@ Issues are sorted by status: OPEN → NEEDS_REVIEW → FIXED → PARTIAL → VAL
 - **Date**: 2026-06-14
 - **Changes**: Used `tempfile + os.replace` for atomic writes in `_write_bookmarks` to prevent partial writes on crash. Added a class-level `_bookmark_lock` to serialize read-modify-write cycles in `_save_bookmark` and `_clear_bookmark`. Updated `src/app.py`.
 
+> **Attribution note (issue-solution-validator, 2026-07-11):** This fix (the `_bookmark_lock` and the atomic `tempfile` + `os.replace` write in `_write_bookmarks`) landed in commit `ccf7b68` (Engineer_Mack's concurrent round) together with ISSUE-032 through ISSUE-035. Unlike those four, this issue's top-level `Status` field was left at `OPEN` in that commit even though the fix was fully present in the diff — apparently an authoring oversight, not a sign the fix is incomplete. Confirmed complete and correct below; promoted straight to VALIDATED.
+
 ### Validation
 - **Date**: 2026-06-14
 - **Method**: Code inspection
@@ -1476,3 +1537,33 @@ Issues are sorted by status: OPEN → NEEDS_REVIEW → FIXED → PARTIAL → VAL
 > 2. Add targeted unit tests for this specific fix (e.g. mock-based test for the changed logic).
 > 3. Perform an independent code review of the changed lines before promoting status to VALIDATED.
 > 4. Verify the fix description matches the actual code change.
+
+### Validation (independent — issue-solution-validator, 2026-07-11)
+- **Date**: 2026-07-11
+- **Method**: Tests + code inspection
+- **Tests**: `tests/test_issue_validations.py` — `TestIssue036BookmarkLockAndAtomicWrite`: test_bookmark_lock_initialized_in_init, test_bookmark_lock_is_instance_attribute_not_class_level, test_save_bookmark_serializes_under_lock, test_clear_bookmark_serializes_under_lock, test_write_bookmarks_uses_tempfile_and_atomic_replace, test_save_bookmark_lock_actually_serializes_concurrent_callers, test_write_bookmarks_atomic_failure_preserves_original_file, test_write_bookmarks_success_leaves_no_stray_temp_file, test_save_bookmark_end_to_end_still_persists_correctly (9 tests)
+- **Results**: 9 passed, 0 failed
+  - ✅ test_bookmark_lock_initialized_in_init
+  - ✅ test_bookmark_lock_is_instance_attribute_not_class_level
+  - ✅ test_save_bookmark_serializes_under_lock
+  - ✅ test_clear_bookmark_serializes_under_lock
+  - ✅ test_write_bookmarks_uses_tempfile_and_atomic_replace
+  - ✅ test_save_bookmark_lock_actually_serializes_concurrent_callers
+  - ✅ test_write_bookmarks_atomic_failure_preserves_original_file
+  - ✅ test_write_bookmarks_success_leaves_no_stray_temp_file
+  - ✅ test_save_bookmark_end_to_end_still_persists_correctly
+- **Inspection**: `_bookmark_lock` is created as `threading.Lock()` in `DocumentReaderApp.__init__` (app.py line 51) — an instance attribute, not literally class-level as the Fix note states, but functionally equivalent for this single-instance GUI app (one app, one lock, same serialization guarantee). `_save_bookmark` and `_clear_bookmark` (lines 635-660) both wrap their read-modify-write cycle in `with self._bookmark_lock:`. `_write_bookmarks` (lines 662-679) writes to a `tempfile.mkstemp`-created temp file and only calls `os.replace(tmp_path, _BOOKMARKS_FILE)` after a successful `json.dump`; on any exception during the write it unlinks the temp file and re-raises, caught by the outer `except OSError` which logs and swallows.
+- **Behavioral confirmation the lock actually serializes** (not just present syntactically): a test blocked one `_save_bookmark` call mid-`_load_bookmarks` via an `Event` and proved a concurrent second caller could not complete within 0.3s until the first released the lock and finished its write.
+- **Behavioral confirmation of atomic-write safety**: simulated an `OSError` during `json.dump` (the realistic "disk full" case) and confirmed the original bookmarks file is left byte-for-byte unchanged, with no stray `.bookmarks-*.tmp` file left behind. A normal successful write was also confirmed to leave no stray temp file.
+- **Narrow residual gap (not filed as a new issue)**: `_write_bookmarks`'s outer exception handler only catches `OSError`; a non-`OSError` exception during `json.dump` (e.g. a hypothetical `TypeError` from non-serializable data) would propagate up through `_save_bookmark`/`_clear_bookmark` uncaught, past the `with self._bookmark_lock:` block (the lock itself still releases correctly via the context manager) and into the GUI-thread caller. Not filed: bookmark dict values are internally controlled ints/strings, not user input, so this path is not realistically reachable — the same "recovery paths need guarding too" pattern noted for ISSUE-026/029, but with no plausible trigger here.
+- **Verdict**: VALIDATED. The lock demonstrably serializes concurrent bookmark read-modify-write cycles, and the atomic temp-file-plus-replace write demonstrably prevents a partial/corrupted bookmarks file on a realistic (OSError) write failure. The Status field being `OPEN` in the source commit was an authoring oversight — the fix itself is complete.
+- **New Issues**: None
+
+---
+
+## Logging infrastructure added
+
+- **`main.py`**: Added `_setup_logging()` configuring root logging to stderr + `~/documentreader.log`, level via `DOCREADER_LOGLEVEL` env (default DEBUG). Called before importing the app so import-time errors are captured. Format includes thread name (critical for diagnosing the threading issues above).
+- Module loggers (`logging.getLogger(__name__)`) added to `app.py`, `tts_engine.py`, `audio_player.py`, `voice_manager.py`, `pdf_reader.py`.
+- Replaced the two bare `print(...)` error reports in `tts_engine.py` with `log.exception(...)`.
+- No control flow was altered by logging; all additions are observational.
