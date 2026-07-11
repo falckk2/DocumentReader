@@ -3,6 +3,7 @@ import logging
 import os
 import tempfile
 import threading
+from datetime import datetime
 import tkinter as tk
 import tkinter.filedialog as fd
 import tkinter.messagebox as mb
@@ -16,6 +17,13 @@ from src.voice_manager import VoiceManager
 log = logging.getLogger(__name__)
 
 _BOOKMARKS_FILE = os.path.join(os.path.expanduser("~"), ".documentreader_bookmarks.json")
+
+# Periodic bookmark autosave interval while reading (crash protection):
+# a crash/kill loses at most this much reading progress.
+_AUTOSAVE_MS = 15000
+
+# Maximum entries shown in the Recent-documents menu.
+_RECENT_LIMIT = 10
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
@@ -81,6 +89,20 @@ class DocumentReaderApp(ctk.CTk):
         self.bind(self._sentence_done_event, self._on_sentence_done_event)
         # ISSUE-037 fix: same reasoning for the voice-load-complete event.
         self.bind(self._voices_loaded_event, self._on_voices_loaded_event)
+
+        # Keyboard shortcuts: Space toggles play/pause, Left/Right skip a
+        # sentence, PgUp/PgDn switch pages. Bound on the toplevel; the CTk
+        # buttons are canvas-based and don't consume these keys themselves.
+        self.bind("<space>", self._on_key_toggle_play)
+        self.bind("<Left>", lambda _e: self._skip_sentence(-1))
+        self.bind("<Right>", lambda _e: self._skip_sentence(+1))
+        self.bind("<Prior>", lambda _e: self._prev_page())
+        self.bind("<Next>", lambda _e: self._next_page())
+
+        # Periodic bookmark autosave while reading, so a crash/kill loses at
+        # most _AUTOSAVE_MS of progress (pause/stop/close saves are unchanged).
+        self.after(_AUTOSAVE_MS, self._autosave_tick)
+
         self._load_voices()
 
     # ------------------------------------------------------------------
@@ -94,19 +116,29 @@ class DocumentReaderApp(ctk.CTk):
         # ── Top bar ────────────────────────────────────────────────────
         top = ctk.CTkFrame(self, corner_radius=0)
         top.grid(row=0, column=0, sticky="ew", padx=0, pady=0)
-        top.grid_columnconfigure(1, weight=1)
+        top.grid_columnconfigure(2, weight=1)
 
         ctk.CTkButton(top, text="Open PDF", width=110, command=self._open_pdf).grid(
-            row=0, column=0, padx=12, pady=8
+            row=0, column=0, padx=(12, 6), pady=8
         )
+
+        # Recent-documents menu: acts as a menu, not a selection — the
+        # variable is reset to the placeholder after every pick.
+        self._recent_paths: dict[str, str] = {}
+        self._recent_var = tk.StringVar(value="Recent ▾")
+        self._recent_menu = ctk.CTkOptionMenu(
+            top, variable=self._recent_var, values=["(no recent documents)"],
+            width=140, command=self._on_recent_selected,
+        )
+        self._recent_menu.grid(row=0, column=1, padx=(0, 8), pady=8)
 
         self._title_label = ctk.CTkLabel(
             top, text="No document loaded", font=ctk.CTkFont(size=14, weight="bold")
         )
-        self._title_label.grid(row=0, column=1, padx=8, pady=8, sticky="w")
+        self._title_label.grid(row=0, column=2, padx=8, pady=8, sticky="w")
 
         self._status_label = ctk.CTkLabel(top, text="", text_color="gray")
-        self._status_label.grid(row=0, column=2, padx=12, pady=8, sticky="e")
+        self._status_label.grid(row=0, column=3, padx=12, pady=8, sticky="e")
 
         # ── Main content area ───────────────────────────────────────────
         content = ctk.CTkFrame(self, corner_radius=0, fg_color="transparent")
@@ -181,9 +213,11 @@ class DocumentReaderApp(ctk.CTk):
 
         ctk.CTkLabel(speed_row, text="Speed:").grid(row=0, column=0, padx=(0, 6))
         self._speed_var = tk.DoubleVar(value=1.0)
+        # 0.5x–5.0x in 0.25 steps (upper bound raised from 2.0 for the
+        # fast-reading feature, 2026-07-11; TTS backends clamp accordingly).
         self._speed_slider = ctk.CTkSlider(
-            speed_row, from_=0.5, to=2.0, variable=self._speed_var,
-            width=160, command=self._on_speed_change,
+            speed_row, from_=0.5, to=5.0, number_of_steps=18,
+            variable=self._speed_var, width=160, command=self._on_speed_change,
         )
         self._speed_slider.grid(row=0, column=1)
         self._speed_display = ctk.CTkLabel(speed_row, text="1.0x", width=44)
@@ -193,28 +227,44 @@ class DocumentReaderApp(ctk.CTk):
         btn_row = ctk.CTkFrame(bottom, fg_color="transparent")
         btn_row.grid(row=1, column=0, columnspan=2, pady=(4, 10))
 
+        self._back_btn = ctk.CTkButton(
+            btn_row, text="⏮", width=44, state="disabled",
+            command=lambda: self._skip_sentence(-1),
+            fg_color="#45475a", hover_color="#585b70",
+        )
+        self._back_btn.grid(row=0, column=0, padx=(8, 4))
+
         self._play_btn = ctk.CTkButton(
             btn_row, text="▶  Play", width=110, command=self._play, state="disabled"
         )
-        self._play_btn.grid(row=0, column=0, padx=8)
+        self._play_btn.grid(row=0, column=1, padx=8)
 
         self._pause_btn = ctk.CTkButton(
             btn_row, text="⏸  Pause", width=110, command=self._pause, state="disabled",
             fg_color="#45475a", hover_color="#585b70",
         )
-        self._pause_btn.grid(row=0, column=1, padx=8)
+        self._pause_btn.grid(row=0, column=2, padx=8)
 
         self._stop_btn = ctk.CTkButton(
             btn_row, text="⏹  Stop", width=110, command=self._stop, state="disabled",
             fg_color="#f38ba8", hover_color="#eba0ac", text_color="#1e1e2e",
         )
-        self._stop_btn.grid(row=0, column=2, padx=8)
+        self._stop_btn.grid(row=0, column=3, padx=8)
+
+        self._fwd_btn = ctk.CTkButton(
+            btn_row, text="⏭", width=44, state="disabled",
+            command=lambda: self._skip_sentence(+1),
+            fg_color="#45475a", hover_color="#585b70",
+        )
+        self._fwd_btn.grid(row=0, column=4, padx=(4, 8))
 
         self._auto_advance_var = tk.BooleanVar(value=False)
         self._auto_advance_cb = ctk.CTkCheckBox(
             btn_row, text="Auto-advance pages", variable=self._auto_advance_var,
         )
-        self._auto_advance_cb.grid(row=0, column=3, padx=24)
+        self._auto_advance_cb.grid(row=0, column=5, padx=24)
+
+        self._refresh_recent_menu()
 
     # ------------------------------------------------------------------
     # Voice loading
@@ -287,6 +337,10 @@ class DocumentReaderApp(ctk.CTk):
         )
         if not path:
             return
+        self._open_pdf_path(path)
+
+    def _open_pdf_path(self, path: str):
+        """Open *path* directly (file dialog and Recent menu both land here)."""
         self._stop()
         log.info("Opening PDF: %s", path)
         try:
@@ -311,6 +365,8 @@ class DocumentReaderApp(ctk.CTk):
         # enables Play (if a PDF is open) once voices actually arrive.
         if self._voices_ready:
             self._play_btn.configure(state="normal")
+        self._record_document_opened(path)
+        self._refresh_recent_menu()
         self._restore_bookmark(path)
 
     def _update_page_display(self):
@@ -370,6 +426,8 @@ class DocumentReaderApp(ctk.CTk):
             self._play_btn.configure(state="disabled")
             self._pause_btn.configure(state="normal")
             self._stop_btn.configure(state="normal")
+            self._back_btn.configure(state="normal")
+            self._fwd_btn.configure(state="normal")
             # For offline, _player.is_paused is False after stop, so resume()
             # is a no-op; we fall through to _read_next_sentence to restart.
             if not self._tts.is_playing:
@@ -398,6 +456,8 @@ class DocumentReaderApp(ctk.CTk):
         self._play_btn.configure(state="disabled")
         self._pause_btn.configure(state="normal")
         self._stop_btn.configure(state="normal")
+        self._back_btn.configure(state="normal")
+        self._fwd_btn.configure(state="normal")
         self._read_next_sentence()
 
     def _pause(self):
@@ -451,6 +511,46 @@ class DocumentReaderApp(ctk.CTk):
         )
         self._pause_btn.configure(state="disabled")
         self._stop_btn.configure(state="disabled")
+        self._back_btn.configure(state="disabled")
+        self._fwd_btn.configure(state="disabled")
+
+    def _skip_sentence(self, delta: int):
+        """Skip ahead (+1) or back (-1) one sentence while reading or paused."""
+        if not self._pdf.is_open or not self._sentences:
+            return
+        if self._reading and not self._paused:
+            # ISSUE-007: _sentence_idx was post-incremented, so the in-flight
+            # sentence is _sentence_idx - 1.
+            target = self._sentence_idx - 1 + delta
+            if target >= len(self._sentences):
+                self._set_status("Already at the last sentence on this page.")
+                return
+            self._sentence_idx = max(0, target)
+            log.info("Skip %+d while reading -> sentence idx=%d", delta, self._sentence_idx)
+            # _read_next_sentence -> speak() stops the current utterance; the
+            # generation bump (ISSUE-017) suppresses its stale on_done, same
+            # as the ISSUE-016 mid-sentence speed restart.
+            self._read_next_sentence()
+        elif self._paused:
+            # While paused _sentence_idx already points at the interrupted
+            # sentence (ISSUE-007 rewind in _pause).
+            self._sentence_idx = max(0, min(self._sentence_idx + delta,
+                                            len(self._sentences) - 1))
+            log.info("Skip %+d while paused -> sentence idx=%d", delta, self._sentence_idx)
+            # Drop any paused MCI track so Resume falls through to re-read
+            # from the new index instead of resuming the old audio (the
+            # ISSUE-031 re-advance branch must not fire for a skipped-away
+            # sentence).
+            self._tts.stop()
+            self._save_bookmark()
+            self._set_status(f"Will resume at sentence {self._sentence_idx + 1}.")
+
+    def _on_key_toggle_play(self, _event=None):
+        """Space bar: pause while reading, otherwise play/resume."""
+        if self._reading and not self._paused:
+            self._pause()
+        elif self._pdf.is_open and self._voices_ready:
+            self._play()
 
     def _read_next_sentence(self):
         if not self._reading or self._paused:
@@ -477,6 +577,9 @@ class DocumentReaderApp(ctk.CTk):
         speed = self._speed_var.get()
         log.debug("Speaking sentence idx=%d (len=%d) voice=%s source=%s speed=%.2f",
                   self._sentence_idx, len(sentence), voice.id, voice.source, speed)
+        self._set_status(
+            f"Reading sentence {self._sentence_idx + 1} of {len(self._sentences)}"
+        )
         self._sentence_idx += 1
         self._tts.speak(sentence, voice, speed, on_done=self._on_sentence_done)
 
@@ -639,12 +742,17 @@ class DocumentReaderApp(ctk.CTk):
         # ISSUE-036 fix: serialize the read-modify-write cycle.
         with self._bookmark_lock:
             bookmarks = self._load_bookmarks()
-            bookmarks[self._current_pdf_path] = {
-                "page": self._current_page if page is None else page,
-                "sentence_idx": self._sentence_idx if sentence_idx is None else sentence_idx,
-            }
-            log.debug("Saving bookmark for %s: %r",
-                      self._current_pdf_path, bookmarks[self._current_pdf_path])
+            # Merge into the existing entry so metadata keys written by
+            # _record_document_opened (e.g. last_opened) survive a save.
+            entry = bookmarks.get(self._current_pdf_path)
+            if not isinstance(entry, dict):
+                entry = {}
+            entry["page"] = self._current_page if page is None else page
+            entry["sentence_idx"] = (
+                self._sentence_idx if sentence_idx is None else sentence_idx
+            )
+            bookmarks[self._current_pdf_path] = entry
+            log.debug("Saving bookmark for %s: %r", self._current_pdf_path, entry)
             self._write_bookmarks(bookmarks)
 
     def _clear_bookmark(self):
@@ -701,37 +809,89 @@ class DocumentReaderApp(ctk.CTk):
         if page >= self._pdf.page_count:
             log.warning("Bookmark page %d out of range; ignoring", page)
             return False
-        # Skip the prompt if the bookmark is at the very beginning
+        # Nothing to resume if the bookmark is at the very beginning
         if page == 0 and sentence_idx == 0:
             return True
-        resume = mb.askyesno(
-            "Resume Reading",
-            f"A bookmark was found for this document.\n\n"
-            f"Resume from page {page + 1}, sentence {sentence_idx + 1}?",
-        )
-        if resume:
-            self._current_page = page
-            # Only reload page text if jumping to a different page
-            if page != 0:
-                # ISSUE-039 fix: single extraction shared for text + sentences.
-                text, self._sentences = self._pdf.get_text_and_sentences(self._current_page)
-                self._text_box.configure(state="normal")
-                self._text_box.delete("1.0", "end")
-                self._text_box.insert("end", text if text else "(No text found on this page)")
-                self._text_box.configure(state="disabled")
-                self._page_label.configure(text=f"Page {page + 1} of {self._pdf.page_count}")
-                self._update_nav_buttons()
-            # ISSUE-009 fix: clamp sentence_idx to valid range so a stale
-            # bookmark (e.g. PDF was re-saved with fewer sentences) does not
-            # silently skip playback by starting past the last sentence.
-            # ISSUE-024 fix: clamp the lower bound too (negative values).
-            max_idx = max(0, len(self._sentences) - 1)
-            clamped = max(0, min(sentence_idx, max_idx))
-            if clamped != sentence_idx:
-                log.warning("Bookmark sentence_idx=%d clamped to %d (page has %d sentences)",
-                            sentence_idx, clamped, len(self._sentences))
-            self._sentence_idx = clamped
+        # Auto-resume: proceed from where we left off without prompting
+        # (user decision 2026-07-11; previously a yes/no resume dialog).
+        self._current_page = page
+        # Only reload page text if jumping to a different page
+        if page != 0:
+            # ISSUE-039 fix: single extraction shared for text + sentences.
+            text, self._sentences = self._pdf.get_text_and_sentences(self._current_page)
+            self._text_box.configure(state="normal")
+            self._text_box.delete("1.0", "end")
+            self._text_box.insert("end", text if text else "(No text found on this page)")
+            self._text_box.configure(state="disabled")
+            self._page_label.configure(text=f"Page {page + 1} of {self._pdf.page_count}")
+            self._update_nav_buttons()
+        # ISSUE-009 fix: clamp sentence_idx to valid range so a stale
+        # bookmark (e.g. PDF was re-saved with fewer sentences) does not
+        # silently skip playback by starting past the last sentence.
+        # ISSUE-024 fix: clamp the lower bound too (negative values).
+        max_idx = max(0, len(self._sentences) - 1)
+        clamped = max(0, min(sentence_idx, max_idx))
+        if clamped != sentence_idx:
+            log.warning("Bookmark sentence_idx=%d clamped to %d (page has %d sentences)",
+                        sentence_idx, clamped, len(self._sentences))
+        self._sentence_idx = clamped
+        self._set_status(f"Resumed at page {page + 1}, sentence {clamped + 1}")
         return True
+
+    def _autosave_tick(self):
+        """Periodic bookmark autosave while reading; reschedules itself."""
+        try:
+            if self._reading and not self._paused and self._current_pdf_path:
+                # ISSUE-007: _sentence_idx was post-incremented, so the
+                # sentence being read is idx-1. Save that position without
+                # mutating the live index.
+                idx = max(0, self._sentence_idx - 1)
+                self._save_bookmark(sentence_idx=idx)
+                log.debug("Autosaved bookmark (page=%d, sentence_idx=%d)",
+                          self._current_page, idx)
+        finally:
+            self.after(_AUTOSAVE_MS, self._autosave_tick)
+
+    def _record_document_opened(self, path: str):
+        """Track every opened document in the bookmarks file (last_opened)."""
+        # ISSUE-036 fix: serialize the read-modify-write cycle.
+        with self._bookmark_lock:
+            bookmarks = self._load_bookmarks()
+            entry = bookmarks.get(path)
+            if not isinstance(entry, dict):
+                entry = {}
+            entry["last_opened"] = datetime.now().isoformat(timespec="seconds")
+            bookmarks[path] = entry
+            self._write_bookmarks(bookmarks)
+
+    def _get_recent_files(self, limit: int = _RECENT_LIMIT) -> list[str]:
+        """Most recently opened documents that still exist on disk."""
+        entries = [(p, e.get("last_opened", ""))
+                   for p, e in self._load_bookmarks().items()
+                   if isinstance(e, dict)]
+        entries.sort(key=lambda t: t[1], reverse=True)
+        return [p for p, _ in entries if os.path.exists(p)][:limit]
+
+    def _refresh_recent_menu(self):
+        recent = self._get_recent_files()
+        self._recent_paths = {}
+        for p in recent:
+            label = os.path.basename(p)
+            if label in self._recent_paths:
+                # Same filename in two directories: disambiguate the newer dup.
+                label = f"{label} ({os.path.dirname(p)})"
+            self._recent_paths[label] = p
+        values = list(self._recent_paths) or ["(no recent documents)"]
+        self._recent_menu.configure(values=values)
+        self._recent_var.set("Recent ▾")
+
+    def _on_recent_selected(self, label: str):
+        path = self._recent_paths.get(label)
+        # Restore the placeholder so the widget behaves like a menu.
+        self._recent_var.set("Recent ▾")
+        if not path or path == self._current_pdf_path:
+            return
+        self._open_pdf_path(path)
 
     def on_close(self):
         log.info("Window closing; tearing down "

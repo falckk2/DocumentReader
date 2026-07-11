@@ -434,13 +434,13 @@ class TestIssue008BasenameUsage(unittest.TestCase):
 
     def test_open_pdf_uses_os_path_basename(self):
         import src.app as app_mod
-        src = inspect.getsource(app_mod.DocumentReaderApp._open_pdf)
+        src = inspect.getsource(app_mod.DocumentReaderApp._open_pdf_path)
         self.assertIn("os.path.basename", src,
                       "_open_pdf does not use os.path.basename (ISSUE-008 fix missing)")
 
     def test_open_pdf_does_not_use_manual_split(self):
         import src.app as app_mod
-        src = inspect.getsource(app_mod.DocumentReaderApp._open_pdf)
+        src = inspect.getsource(app_mod.DocumentReaderApp._open_pdf_path)
         self.assertNotIn('split("/")', src,
                          "_open_pdf still uses manual path.split('/') instead of os.path.basename")
         self.assertNotIn('split("\\\\")', src,
@@ -609,9 +609,15 @@ class TestIssue012SpeedRateClamping(unittest.TestCase):
                          f"Speed below 0.5 should clamp to -50%; got {result}")
 
     def test_out_of_range_high_is_clamped(self):
-        result = self._rate(3.0)
-        self.assertEqual(result, "+100%",
-                         f"Speed above 2.0 should clamp to +100%; got {result}")
+        # Upper clamp raised to +400% (5x) for the fast-reading feature
+        # (2026-07-11); anything above still clamps.
+        result = self._rate(6.0)
+        self.assertEqual(result, "+400%",
+                         f"Speed above 5.0 should clamp to +400%; got {result}")
+
+    def test_five_x_speed_maps_to_plus_400(self):
+        self.assertEqual(self._rate(5.0), "+400%",
+                         "5.0x speed should map to +400% (fast-reading feature)")
 
     def test_round_not_truncate(self):
         """1.5x -> 50% (both round and int give same); 1.455 -> 46% (round) vs 45% (int)."""
@@ -623,13 +629,14 @@ class TestIssue012SpeedRateClamping(unittest.TestCase):
                          f"_speed_to_edge_rate should use round(); got {result}")
 
     def test_offline_speed_clamped_wpm(self):
-        """Offline speed mapping: max(80, min(500, round(200*speed)))."""
+        """Offline speed mapping: max(80, min(1000, round(200*speed))).
+        Upper clamp raised from 500 to 1000 wpm for 5x speed (2026-07-11)."""
         from src.tts_engine import TTSEngine
         src = inspect.getsource(TTSEngine._speak_offline)
         self.assertIn("max(80", src,
                       "_speak_offline offline rate not clamped at 80 wpm minimum")
-        self.assertIn("min(500", src,
-                      "_speak_offline offline rate not clamped at 500 wpm maximum")
+        self.assertIn("min(1000", src,
+                      "_speak_offline offline rate not clamped at 1000 wpm maximum")
         self.assertIn("round(200", src,
                       "_speak_offline offline rate uses int() instead of round()")
 
@@ -945,6 +952,8 @@ class TestIssue016ImmediateSpeedApply(unittest.TestCase):
         app._play_btn = MagicMock()
         app._pause_btn = MagicMock()
         app._stop_btn = MagicMock()
+        app._back_btn = MagicMock()
+        app._fwd_btn = MagicMock()
         app._stop()
         app.after_cancel.assert_called_once_with("speed#7")
         self.assertIsNone(app._speed_debounce_id,
@@ -991,6 +1000,7 @@ class TestIssue016ImmediateSpeedApply(unittest.TestCase):
         app._voice_var.get.return_value = "Some Voice"
         app._voices = MagicMock()      # find_by_display -> truthy mock voice
         app._highlight_sentence = MagicMock()
+        app._set_status = MagicMock()  # real pump shows reading progress
         app._tts = MagicMock()
         app.after = MagicMock(return_value="after#1")
         app.after_cancel = MagicMock()
@@ -1994,9 +2004,9 @@ class TestIssue024BookmarkValidation(unittest.TestCase):
         app._sentences = ["s1", "s2"]
         app._current_page = 0
         app._sentence_idx = 0
+        app._set_status = MagicMock()  # auto-resume reports the position
         with patch.object(app_mod.DocumentReaderApp, "_load_bookmarks",
-                          return_value={"p.pdf": {"page": 0, "sentence_idx": -3}}), \
-             patch.object(app_mod.mb, "askyesno", return_value=True):
+                          return_value={"p.pdf": {"page": 0, "sentence_idx": -3}}):
             result = app._restore_bookmark("p.pdf")
         self.assertTrue(result, "_restore_bookmark should report the bookmark existed")
         self.assertEqual(app._sentence_idx, 0,
@@ -2585,9 +2595,12 @@ class TestIssue031OnlineResumeReadvance(unittest.TestCase):
         app._play_btn = MagicMock()
         app._pause_btn = MagicMock()
         app._stop_btn = MagicMock()
+        app._back_btn = MagicMock()     # sentence-skip buttons (2026-07-11)
+        app._fwd_btn = MagicMock()
         app._save_bookmark = MagicMock()
         app._highlight_sentence = MagicMock()
         app._clear_highlight = MagicMock()
+        app._set_status = MagicMock()   # real pump shows reading progress
         app._pending_after_id = None
         app._speed_debounce_id = None   # ISSUE-016: cleared by _stop
         app._voices_ready = True        # ISSUE-038: _stop's play_btn gate reads this
@@ -2871,6 +2884,8 @@ class TestIssue038PlayGatedOnVoicesReady(unittest.TestCase):
         app._update_page_display = MagicMock()
         app._update_nav_buttons = MagicMock()
         app._restore_bookmark = MagicMock()
+        app._record_document_opened = MagicMock()  # document-history feature (2026-07-11)
+        app._refresh_recent_menu = MagicMock()
         app._play_btn = MagicMock()
         app._voices_ready = voices_ready
         app._current_pdf_path = None
@@ -2961,6 +2976,8 @@ class TestIssue038PlayGatedOnVoicesReady(unittest.TestCase):
         app._play_btn = MagicMock()
         app._pause_btn = MagicMock()
         app._stop_btn = MagicMock()
+        app._back_btn = MagicMock()   # sentence-skip buttons (2026-07-11)
+        app._fwd_btn = MagicMock()
         return app
 
     def test_stop_disables_play_when_voices_not_ready_even_if_pdf_open(self):
@@ -3611,6 +3628,328 @@ class TestIssue036BookmarkLockAndAtomicWrite(unittest.TestCase):
             self.assertEqual(data.get("C:/doc.pdf"), {"page": 3, "sentence_idx": 5})
         finally:
             os.remove(path)
+
+
+# ---------------------------------------------------------------------------
+# Feature round 2026-07-11 — sentence skip, autosave, document history,
+# auto-resume, 5x speed (slider), keyboard toggle
+# ---------------------------------------------------------------------------
+
+class TestFeatureSentenceSkip(unittest.TestCase):
+
+    def _make_app(self, reading=True, paused=False, sentence_idx=2,
+                  sentences=None):
+        import src.app as app_mod
+        app = app_mod.DocumentReaderApp.__new__(app_mod.DocumentReaderApp)
+        app._pdf = MagicMock()                  # is_open truthy
+        app._sentences = sentences if sentences is not None else ["s0", "s1", "s2", "s3"]
+        app._sentence_idx = sentence_idx
+        app._reading = reading
+        app._paused = paused
+        app._tts = MagicMock()
+        app._read_next_sentence = MagicMock()
+        app._save_bookmark = MagicMock()
+        app._set_status = MagicMock()
+        return app
+
+    def test_skip_forward_while_reading_jumps_to_next_sentence(self):
+        # In-flight sentence is idx-1 == "s1"; forward skip must speak "s2".
+        app = self._make_app(sentence_idx=2)
+        app._skip_sentence(+1)
+        self.assertEqual(app._sentence_idx, 2,
+                         "forward skip target must be the sentence AFTER the in-flight one")
+        app._read_next_sentence.assert_called_once()
+
+    def test_skip_back_while_reading_replays_previous_sentence(self):
+        # In-flight is "s1" (idx-1); back skip must speak "s0".
+        app = self._make_app(sentence_idx=2)
+        app._skip_sentence(-1)
+        self.assertEqual(app._sentence_idx, 0)
+        app._read_next_sentence.assert_called_once()
+
+    def test_skip_back_clamps_at_first_sentence(self):
+        app = self._make_app(sentence_idx=1)  # in-flight is "s0"
+        app._skip_sentence(-1)
+        self.assertEqual(app._sentence_idx, 0,
+                         "back skip at the first sentence must clamp to 0, not go negative")
+        app._read_next_sentence.assert_called_once()
+
+    def test_skip_forward_past_last_sentence_is_noop(self):
+        app = self._make_app(sentence_idx=4)  # in-flight is "s3" (last)
+        app._skip_sentence(+1)
+        self.assertEqual(app._sentence_idx, 4, "index must not move past the page end")
+        app._read_next_sentence.assert_not_called()
+        app._set_status.assert_called_once()
+
+    def test_skip_is_noop_when_stopped(self):
+        app = self._make_app(reading=False, paused=False)
+        app._skip_sentence(+1)
+        app._read_next_sentence.assert_not_called()
+        app._tts.stop.assert_not_called()
+
+    def test_skip_is_noop_with_no_sentences(self):
+        app = self._make_app(sentences=[])
+        app._skip_sentence(+1)
+        app._read_next_sentence.assert_not_called()
+
+    def test_skip_while_paused_moves_index_and_drops_paused_track(self):
+        """Paused skip must stop the paused MCI track so Resume falls through
+        to re-read from the new index (the ISSUE-031 re-advance branch must
+        not resume audio of a sentence the user skipped away from)."""
+        app = self._make_app(paused=True, sentence_idx=1)
+        app._skip_sentence(+1)
+        self.assertEqual(app._sentence_idx, 2)
+        app._tts.stop.assert_called_once()
+        app._save_bookmark.assert_called_once()
+        app._read_next_sentence.assert_not_called()  # deferred until Resume
+
+    def test_skip_while_paused_clamps_both_ends(self):
+        app = self._make_app(paused=True, sentence_idx=0)
+        app._skip_sentence(-1)
+        self.assertEqual(app._sentence_idx, 0)
+        app = self._make_app(paused=True, sentence_idx=3)
+        app._skip_sentence(+1)
+        self.assertEqual(app._sentence_idx, 3,
+                         "paused forward skip must clamp at the last sentence")
+
+
+class TestFeatureBookmarkAutosave(unittest.TestCase):
+
+    def _make_app(self, reading=True, paused=False, sentence_idx=3):
+        import src.app as app_mod
+        app = app_mod.DocumentReaderApp.__new__(app_mod.DocumentReaderApp)
+        app._reading = reading
+        app._paused = paused
+        app._sentence_idx = sentence_idx
+        app._current_page = 2
+        app._current_pdf_path = "C:/doc.pdf"
+        app._save_bookmark = MagicMock()
+        app.after = MagicMock()
+        return app
+
+    def test_autosave_saves_inflight_sentence_while_reading(self):
+        app = self._make_app(reading=True, sentence_idx=3)
+        app._autosave_tick()
+        # ISSUE-007 post-increment: the in-flight sentence is idx-1.
+        app._save_bookmark.assert_called_once_with(sentence_idx=2)
+
+    def test_autosave_skips_when_idle(self):
+        app = self._make_app(reading=False)
+        app._autosave_tick()
+        app._save_bookmark.assert_not_called()
+
+    def test_autosave_skips_when_paused(self):
+        """_pause already saved the rewound position; an autosave while paused
+        would be redundant (and racy if the user is skipping sentences)."""
+        app = self._make_app(reading=True, paused=True)
+        app._autosave_tick()
+        app._save_bookmark.assert_not_called()
+
+    def test_autosave_always_reschedules_itself(self):
+        import src.app as app_mod
+        for kwargs in ({"reading": True}, {"reading": False}):
+            app = self._make_app(**kwargs)
+            app._autosave_tick()
+            app.after.assert_called_once_with(app_mod._AUTOSAVE_MS, app._autosave_tick)
+
+    def test_autosave_reschedules_even_if_save_raises(self):
+        app = self._make_app(reading=True)
+        app._save_bookmark.side_effect = RuntimeError("disk full")
+        with self.assertRaises(RuntimeError):
+            app._autosave_tick()
+        app.after.assert_called_once()
+
+    def test_autosave_timer_started_in_init(self):
+        import src.app as app_mod
+        src = inspect.getsource(app_mod.DocumentReaderApp.__init__)
+        self.assertIn("_autosave_tick", src,
+                      "__init__ must start the periodic autosave timer")
+
+
+class TestFeatureDocumentHistory(unittest.TestCase):
+
+    def _make_app(self):
+        import src.app as app_mod
+        app = app_mod.DocumentReaderApp.__new__(app_mod.DocumentReaderApp)
+        app._bookmark_lock = threading.Lock()
+        app._current_pdf_path = "C:/doc.pdf"
+        app._current_page = 1
+        app._sentence_idx = 4
+        return app
+
+    def test_record_document_opened_writes_last_opened(self):
+        import json
+        import src.app as app_mod
+        fd_, path = tempfile.mkstemp(suffix=".json")
+        os.close(fd_)
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({}, f)
+            app = self._make_app()
+            with patch.object(app_mod, "_BOOKMARKS_FILE", path):
+                app._record_document_opened("C:/doc.pdf")
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            self.assertIn("last_opened", data["C:/doc.pdf"],
+                          "_record_document_opened must stamp last_opened")
+        finally:
+            os.remove(path)
+
+    def test_record_preserves_existing_bookmark_position(self):
+        import json
+        import src.app as app_mod
+        fd_, path = tempfile.mkstemp(suffix=".json")
+        os.close(fd_)
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"C:/doc.pdf": {"page": 7, "sentence_idx": 3}}, f)
+            app = self._make_app()
+            with patch.object(app_mod, "_BOOKMARKS_FILE", path):
+                app._record_document_opened("C:/doc.pdf")
+            with open(path, encoding="utf-8") as f:
+                entry = json.load(f)["C:/doc.pdf"]
+            self.assertEqual(entry["page"], 7,
+                             "recording an open must not clobber the saved position")
+            self.assertEqual(entry["sentence_idx"], 3)
+        finally:
+            os.remove(path)
+
+    def test_save_bookmark_preserves_last_opened(self):
+        import json
+        import src.app as app_mod
+        fd_, path = tempfile.mkstemp(suffix=".json")
+        os.close(fd_)
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"C:/doc.pdf": {"last_opened": "2026-07-11T10:00:00"}}, f)
+            app = self._make_app()
+            with patch.object(app_mod, "_BOOKMARKS_FILE", path):
+                app._save_bookmark()
+            with open(path, encoding="utf-8") as f:
+                entry = json.load(f)["C:/doc.pdf"]
+            self.assertEqual(entry["last_opened"], "2026-07-11T10:00:00",
+                             "_save_bookmark must merge, not clobber, metadata keys")
+            self.assertEqual(entry["page"], 1)
+            self.assertEqual(entry["sentence_idx"], 4)
+        finally:
+            os.remove(path)
+
+    def test_get_recent_files_sorts_by_last_opened_and_drops_missing(self):
+        import src.app as app_mod
+        app = app_mod.DocumentReaderApp.__new__(app_mod.DocumentReaderApp)
+        fd_a, real_a = tempfile.mkstemp(suffix=".pdf")
+        os.close(fd_a)
+        fd_b, real_b = tempfile.mkstemp(suffix=".pdf")
+        os.close(fd_b)
+        try:
+            bookmarks = {
+                real_a: {"last_opened": "2026-07-10T09:00:00"},
+                real_b: {"last_opened": "2026-07-11T09:00:00"},
+                "C:/gone/missing.pdf": {"last_opened": "2026-07-12T09:00:00"},
+                "C:/bad/entry.pdf": "not-a-dict",
+            }
+            with patch.object(app_mod.DocumentReaderApp, "_load_bookmarks",
+                              return_value=bookmarks):
+                recent = app._get_recent_files()
+            self.assertEqual(recent, [real_b, real_a],
+                             "recent files must be newest-first and exclude "
+                             "missing files and malformed entries")
+        finally:
+            os.remove(real_a)
+            os.remove(real_b)
+
+
+class TestFeatureAutoResume(unittest.TestCase):
+
+    def _make_app(self):
+        import src.app as app_mod
+        app = app_mod.DocumentReaderApp.__new__(app_mod.DocumentReaderApp)
+        app._pdf = MagicMock(page_count=5)
+        app._sentences = ["s0", "s1", "s2"]
+        app._current_page = 0
+        app._sentence_idx = 0
+        app._set_status = MagicMock()
+        return app
+
+    def test_restore_no_longer_prompts(self):
+        """Auto-resume (2026-07-11): opening a document proceeds from the
+        saved position without an askyesno dialog."""
+        import src.app as app_mod
+        src = inspect.getsource(app_mod.DocumentReaderApp._restore_bookmark)
+        self.assertNotIn("askyesno", src,
+                         "_restore_bookmark still prompts instead of auto-resuming")
+
+    def test_restore_same_page_jumps_to_saved_sentence(self):
+        import src.app as app_mod
+        app = self._make_app()
+        askyesno = MagicMock()
+        with patch.object(app_mod.DocumentReaderApp, "_load_bookmarks",
+                          return_value={"p.pdf": {"page": 0, "sentence_idx": 2}}), \
+             patch.object(app_mod.mb, "askyesno", askyesno):
+            result = app._restore_bookmark("p.pdf")
+        self.assertTrue(result)
+        askyesno.assert_not_called()
+        self.assertEqual(app._sentence_idx, 2)
+        app._set_status.assert_called_once()
+
+    def test_restore_other_page_reloads_text_and_jumps(self):
+        import src.app as app_mod
+        app = self._make_app()
+        app._pdf.get_text_and_sentences.return_value = ("text", ["a", "b", "c", "d"])
+        app._text_box = MagicMock()
+        app._page_label = MagicMock()
+        app._update_nav_buttons = MagicMock()
+        with patch.object(app_mod.DocumentReaderApp, "_load_bookmarks",
+                          return_value={"p.pdf": {"page": 3, "sentence_idx": 3}}):
+            result = app._restore_bookmark("p.pdf")
+        self.assertTrue(result)
+        self.assertEqual(app._current_page, 3)
+        self.assertEqual(app._sentence_idx, 3)
+        app._pdf.get_text_and_sentences.assert_called_once_with(3)
+
+
+class TestFeatureSpeedAndKeyboard(unittest.TestCase):
+
+    def test_slider_range_is_half_to_five_x(self):
+        import src.app as app_mod
+        src = inspect.getsource(app_mod.DocumentReaderApp._build_ui)
+        self.assertIn("to=5.0", src,
+                      "speed slider must reach 5.0x (fast-reading feature)")
+        self.assertIn("from_=0.5", src)
+
+    def test_space_pauses_while_reading(self):
+        import src.app as app_mod
+        app = app_mod.DocumentReaderApp.__new__(app_mod.DocumentReaderApp)
+        app._reading, app._paused = True, False
+        app._pause = MagicMock()
+        app._play = MagicMock()
+        app._on_key_toggle_play()
+        app._pause.assert_called_once()
+        app._play.assert_not_called()
+
+    def test_space_plays_when_idle_and_ready(self):
+        import src.app as app_mod
+        app = app_mod.DocumentReaderApp.__new__(app_mod.DocumentReaderApp)
+        app._reading, app._paused = False, False
+        app._pdf = MagicMock()  # is_open truthy
+        app._voices_ready = True
+        app._pause = MagicMock()
+        app._play = MagicMock()
+        app._on_key_toggle_play()
+        app._play.assert_called_once()
+
+    def test_space_noop_when_voices_not_ready(self):
+        """The keyboard path must respect the ISSUE-038 readiness gate."""
+        import src.app as app_mod
+        app = app_mod.DocumentReaderApp.__new__(app_mod.DocumentReaderApp)
+        app._reading, app._paused = False, False
+        app._pdf = MagicMock()
+        app._voices_ready = False
+        app._pause = MagicMock()
+        app._play = MagicMock()
+        app._on_key_toggle_play()
+        app._play.assert_not_called()
+        app._pause.assert_not_called()
 
 
 if __name__ == "__main__":

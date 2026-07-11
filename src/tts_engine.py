@@ -194,10 +194,11 @@ class TTSEngine:
 
     @staticmethod
     def _speed_to_edge_rate(speed: float) -> str:
-        # ISSUE-012 fix: round (not truncate), and clamp to edge-tts safe range
-        # of -50% to +100%.
+        # ISSUE-012 fix: round (not truncate), and clamp to a safe range.
+        # Upper bound raised from +100% to +400% (5x) for the fast-reading
+        # feature (2026-07-11); the edge-tts prosody rate accepts it.
         pct = round((speed - 1.0) * 100)
-        pct = max(-50, min(100, pct))
+        pct = max(-50, min(400, pct))
         return f"{pct:+d}%"
 
     # ------------------------------------------------------------------
@@ -280,7 +281,9 @@ class TTSEngine:
 
     def _speak_offline(self, text: str, voice: Voice, speed: float, on_done):
         # ISSUE-012 fix: consistent speed mapping (200 wpm base, rounded).
-        rate_wpm = max(80, min(500, round(200 * speed)))
+        # Upper bound raised from 500 to 1000 wpm for 5x speed (2026-07-11);
+        # SAPI5 drivers cap internally if a voice can't go that fast.
+        rate_wpm = max(80, min(1000, round(200 * speed)))
         # ISSUE-017 fix: gate on_done on this utterance's generation so a
         # sentence that completes after stop()/pause()/a newer speak() cannot
         # fire a stale on_done (which caused double sentence advances).
